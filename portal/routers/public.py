@@ -32,7 +32,7 @@ router = APIRouter()
 
 
 def _build_my_booths(bms: list) -> list[dict]:
-    """Build the list of booth cards shown to a logged-in interpreter on the home page.
+    """Build the list of booth cards for all booth memberships belonging to the logged-in user on the home page.
 
     Extracted from ``home()`` to reduce its cyclomatic complexity.
     """
