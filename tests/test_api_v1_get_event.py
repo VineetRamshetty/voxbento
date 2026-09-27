@@ -15,9 +15,9 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
-os.environ.setdefault("BOOTH_ACCESS_TOKEN", "")
-
 import pytest
+
+os.environ.setdefault("BOOTH_ACCESS_TOKEN", "")
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +151,10 @@ class TestGetEvent:
     @pytest.mark.anyio
     async def test_owner_id_is_none_when_no_owner_membership(self, setup_db):
         """If no event_owner row exists, owner_id should be None — not an AttributeError."""
+        from sqlalchemy import delete
+
         from portal.database import get_session
         from portal.models import EventMembership
-        from sqlalchemy import delete
 
         event = await _make_event("no-owner-event", "No Owner Event")
         user = await _make_user("member@example.com")
