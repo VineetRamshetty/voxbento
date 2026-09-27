@@ -84,11 +84,21 @@ async def get_event(
 
     await _verify_token_rbac(db, token, event)
 
+    # Resolve owner_id via EventMembership — Event has no direct owner_id column.
+    # Ownership is represented by role="event_owner" in the event_memberships table.
+    owner_result = await db.execute(
+        select(EventMembership.user_id).where(
+            EventMembership.event_id == event.id,
+            EventMembership.role == "event_owner",
+        )
+    )
+    owner_id = owner_result.scalar_one_or_none()
+
     return {
         "id": event.id,
         "slug": event.slug,
         "display_name": event.display_name,
-        "owner_id": event.owner_id,
+        "owner_id": owner_id,
         "created_at": event.created_at.isoformat(),
     }
 
