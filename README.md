@@ -60,9 +60,6 @@ cd voxbento
 # Configure environment
 cp .env.example .env
 
-# Required: set your admin password (or generate a secure random password)
-echo "ADMIN_PASSWORD=$(openssl rand -hex 16)" >> .env
-
 # Required for API key encryption: set your encryption key (must be 32 characters or longer)
 echo "API_KEY_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> .env
 
