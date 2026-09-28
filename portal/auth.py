@@ -285,7 +285,7 @@ async def get_current_user(request: Request) -> dict | None:
 async def get_accessible_event_ids(request: Request, *, user_id: int | None) -> tuple[bool, set[int] | None]:
     """Return (is_super_admin, allowed_event_ids) for the current request.
 
-    Checks admin_token and user_token cookies to determine super-admin status.
+    Checks the user_token cookie to determine super-admin status.
     For non-super-admins with a user_id, returns the set of event IDs the user
     may access (as event_owner or room_coordinator). Super-admins get None,
     meaning "all events".

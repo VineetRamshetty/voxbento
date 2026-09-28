@@ -79,6 +79,14 @@ For detailed API documentation, environment variables, and configuration, visit 
 
 ## Upgrade Notes
 
+### Admin login migration
+
+The legacy shared `ADMIN_PASSWORD` login has been removed. Before upgrading,
+ensure two active administrator accounts can sign in with their own credentials,
+then remove that variable from all deployment configuration. See the
+[operator migration guide](docs/admin-password-removal-migration.md) for the
+rollout and break-glass recovery procedure.
+
 ### API Key Encryption & Rotation
 A mandatory environment variable `API_KEY_ENCRYPTION_KEY` securely encrypts third-party API keys in the database. 
 - You must generate a secure key (e.g., using `openssl rand -hex 32`) and add it to your `.env` file before starting the application. 

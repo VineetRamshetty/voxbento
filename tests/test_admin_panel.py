@@ -167,6 +167,21 @@ class TestAdminLogin:
         assert resp.status_code == 403
 
     @pytest.mark.anyio
+    async def test_login_fails_closed_when_legacy_password_is_set(self, monkeypatch, setup_db):
+        """A removed shared secret must never regain access through the environment."""
+        monkeypatch.setenv("ADMIN_PASSWORD", "legacy-shared-secret")
+
+        async with _client() as c:
+            resp = await c.post(
+                "/admin/login",
+                data={"email": "admin@example.com", "password": "legacy-shared-secret"},
+                follow_redirects=False,
+            )
+
+        assert resp.status_code == 403
+        assert "user_token" not in resp.headers.get("set-cookie", "")
+
+    @pytest.mark.anyio
     async def test_logout_clears_cookie(self):
         async with _client() as c:
             resp = await c.get("/admin/logout", follow_redirects=False)
