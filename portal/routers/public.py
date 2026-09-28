@@ -150,6 +150,8 @@ async def home(request: Request):
             )
     except Exception as _exc:
         logging.getLogger(__name__).warning("home() DB error: %s", _exc, exc_info=True)
+        event_data = []
+        my_booths = []
 
     return templates.TemplateResponse(
         request=request,

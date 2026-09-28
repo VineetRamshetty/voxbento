@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from portal.auth import create_user_token
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -200,3 +204,108 @@ class TestBuildEventData:
         b = _make_db_booth()
         result = self._call([ev], {1: [b]}, current_user={"is_admin": True})
         assert result[0]["booths"][0]["can_interpret"] is True
+
+
+# ---------------------------------------------------------------------------
+# Home route regression coverage
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def home_db():
+    """Provide an isolated database for home route behavior tests."""
+    from portal.database import configure, dispose, init_db
+
+    configure("sqlite+aiosqlite://")
+    await init_db()
+    yield
+    await dispose()
+
+
+async def _seed_home_event():
+    from portal.database import create_booth, create_event, create_room, get_session
+
+    async with get_session() as session:
+        event = await create_event(session, slug="home-test", display_name="Integration Event")
+        room = await create_room(session, event_id=event.id, display_name="Integration Room")
+        booth = await create_booth(
+            session,
+            event_id=event.id,
+            room_id=room.id,
+            language_code="en",
+            language_name="English",
+        )
+    return event, booth
+
+
+def _home_client():
+    from httpx import ASGITransport, AsyncClient
+
+    from fastapi_app import app
+
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+class TestHomeRouteBehavior:
+    @pytest.mark.anyio
+    async def test_anonymous_home_preserves_public_event_and_registration_path(self, home_db):
+        await _seed_home_event()
+
+        async with _home_client() as client:
+            response = await client.get("/", follow_redirects=False)
+
+        assert response.status_code == 200
+        assert b"Integration Event" in response.content
+        assert b'href="/register"' in response.content
+        assert b"Your Assigned Booths" not in response.content
+        assert b"Enter\n                                                    Lobby" not in response.content
+
+    @pytest.mark.anyio
+    async def test_authenticated_interpreter_home_preserves_dashboard_and_lobby_path(self, home_db):
+        from portal.database import create_user, get_session, set_booth_membership
+
+        _, booth = await _seed_home_event()
+        async with get_session() as session:
+            user = await create_user(
+                session,
+                email="interpreter@example.com",
+                display_name="Interpreter",
+                email_verified=True,
+            )
+            await set_booth_membership(session, user_id=user.id, booth_id=booth.id, role="interpreter")
+
+        token = create_user_token(user_id=user.id, email=user.email, is_admin=False)
+        async with _home_client() as client:
+            response = await client.get("/", cookies={"user_token": token}, follow_redirects=False)
+
+        assert response.status_code == 200
+        assert b"Your Assigned Booths" in response.content
+        assert b"Integration Event" in response.content
+        assert b'href="/admin/events/"' in response.content
+        assert b'href="/interpreter"' in response.content
+
+    @pytest.mark.anyio
+    async def test_database_error_clears_partial_home_context(self, home_db):
+        from portal.database import create_user, get_session, set_booth_membership
+
+        _, booth = await _seed_home_event()
+        async with get_session() as session:
+            user = await create_user(
+                session,
+                email="failure@example.com",
+                display_name="Failure Case",
+                email_verified=True,
+            )
+            await set_booth_membership(session, user_id=user.id, booth_id=booth.id, role="interpreter")
+
+        token = create_user_token(user_id=user.id, email=user.email, is_admin=False)
+        with patch(
+            "portal.routers.public.list_all_booths_for_events",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            async with _home_client() as client:
+                response = await client.get("/", cookies={"user_token": token})
+
+        assert response.status_code == 200
+        assert b"Integration Event" not in response.content
+        assert b"Your Assigned Booths" not in response.content
