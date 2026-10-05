@@ -99,34 +99,41 @@ async def get_event(
 ):
     """Retrieve event details by slug.
 
-    Resolves `owner_id` in a single query via a correlated scalar subquery
-    against `EventMembership` (role='event_owner'). If no owner exists,
-    `owner_id` is None. If multiple owners exist, the lowest `user_id` is returned.
+    Authorization order (RBAC before existence):
+    1. Fetch the event by slug (including soft-deleted) to resolve its ID.
+    2. If the token's event_id doesn't match, return 403 immediately — this
+       prevents callers from probing whether an event exists by comparing
+       403 vs 404 responses.
+    3. Only after RBAC passes, enforce the soft-deletion check (404).
+    4. Query owner_id via a correlated subquery against EventMembership.
     """
+    # Step 1: Fetch by slug (no deleted_at filter) so we can do RBAC first.
+    event_result = await db.execute(select(Event).where(Event.slug == event_slug))
+    event = event_result.scalar_one_or_none()
+
+    # Step 2: RBAC — token must be scoped to this event.
+    if event and token.event_id != event.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    # Step 3: Existence check (event missing or soft-deleted → 404).
+    if not event or event.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    # Step 4: Full RBAC (user-level permissions) + resolve owner_id.
+    await _verify_token_rbac(db, token, event)
+
     owner_subq = (
         select(EventMembership.user_id)
         .where(
-            EventMembership.event_id == Event.id,
+            EventMembership.event_id == event.id,
             EventMembership.role == "event_owner",
         )
         .order_by(EventMembership.user_id)
         .limit(1)
-        .correlate(Event)
         .scalar_subquery()
     )
-
-    result = await db.execute(
-        select(Event, owner_subq.label("owner_id")).where(
-            Event.slug == event_slug,
-            Event.deleted_at.is_(None),
-        )
-    )
-    row = result.first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Event not found")
-    event, owner_id = row
-
-    await _verify_token_rbac(db, token, event)
+    owner_result = await db.execute(select(owner_subq.label("owner_id")))
+    owner_id = owner_result.scalar_one_or_none()
 
     return {
         "id": event.id,
