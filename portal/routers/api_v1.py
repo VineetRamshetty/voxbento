@@ -43,11 +43,17 @@ async def _verify_token_rbac(db: AsyncSession, token: OAuthToken, event: Event, 
     if client and client.is_confidential and client.status == "active":
         return
 
-    # Check if user is super admin or event owner
+    # Reject inactive users before any privilege check.
+    # admin_toggle_user_active can deactivate a user without revoking tokens,
+    # so we must gate on is_active before granting the admin bypass.
     from portal.models import User
 
     user = await db.get(User, token.user_id)
-    if user and (getattr(user, "is_admin", False) or getattr(user, "is_super_admin", False)):
+    if not user or not getattr(user, "is_active", True):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive")
+
+    # Admin bypass — only reached if user is active.
+    if getattr(user, "is_admin", False) or getattr(user, "is_super_admin", False):
         return
 
     # Check Event Owner
