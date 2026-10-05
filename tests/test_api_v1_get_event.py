@@ -103,7 +103,7 @@ async def _make_oauth_token(user_id: int, event_id: int, scopes: list[str]) -> s
             name="Test Client",
             redirect_uris=["https://example.com/callback"],
             scopes_requested=scopes,
-            is_confidential=True,
+            is_confidential=False,  # Public client: wrong-event access returns 403, not 404.
             status="active",
         )
         s.add(client)

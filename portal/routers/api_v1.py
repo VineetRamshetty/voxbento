@@ -34,13 +34,24 @@ router = APIRouter(prefix="/api/v1")
 
 
 async def _verify_token_rbac(db: AsyncSession, token: OAuthToken, event: Event, room_id: int | None = None) -> None:
-    """Ensure the OAuth token is valid for this event, AND the underlying user still has RBAC permissions."""
-    if token.event_id != event.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+    """Ensure the OAuth token is valid for this event, AND the underlying user still has RBAC permissions.
 
-    # Confidential clients manage their own RBAC
+    Event-ID mismatch response depends on client type:
+    - Confidential clients (machine-to-machine): 404 — hides whether the event exists at all.
+    - Non-confidential user tokens: 403 — explicitly tells the user they are denied.
+    """
+    # Fetch the client first so we can tailor the mismatch status code.
     client = await db.get(OAuthClient, token.client_id)
-    if client and client.is_confidential and client.status == "active":
+    is_confidential = bool(client and client.is_confidential and client.status == "active")
+
+    if token.event_id != event.id:
+        if is_confidential:
+            # Confidential clients must not learn whether an event exists.
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    # Confidential clients manage their own RBAC; no further checks needed.
+    if is_confidential:
         return
 
     # Reject inactive users before any privilege check.
@@ -113,20 +124,24 @@ async def get_event(
     3. Only after RBAC passes, enforce the soft-deletion check (404).
     4. Query owner_id via a correlated subquery against EventMembership.
     """
-    # Step 1: Fetch by slug (no deleted_at filter) so we can do RBAC first.
+    # Step 1: Fetch by slug (no deleted_at filter) so RBAC can run before the
+    # existence check — prevents callers from probing event existence by
+    # comparing 403 vs 404 response codes.
     event_result = await db.execute(select(Event).where(Event.slug == event_slug))
     event = event_result.scalar_one_or_none()
 
-    # Step 2: RBAC — token must be scoped to this event.
-    if event and token.event_id != event.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+    # Step 2: Full RBAC — handles event-id mismatch, confidential-client bypass,
+    # inactive-user rejection, and membership checks.
+    # _verify_token_rbac returns the correct status code (403 or 404) based on
+    # client type, so we call it before the existence/soft-deletion check.
+    if event:
+        await _verify_token_rbac(db, token, event)
 
     # Step 3: Existence check (event missing or soft-deleted → 404).
+    # This is intentionally AFTER RBAC so that a wrong-event token cannot
+    # distinguish "forbidden" from "deleted" events.
     if not event or event.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
-
-    # Step 4: Full RBAC (user-level permissions) + resolve owner_id.
-    await _verify_token_rbac(db, token, event)
 
     owner_subq = (
         select(EventMembership.user_id)
