@@ -36,35 +36,35 @@ router = APIRouter(prefix="/api/v1")
 async def _verify_token_rbac(db: AsyncSession, token: OAuthToken, event: Event, room_id: int | None = None) -> None:
     """Ensure the OAuth token is valid for this event, AND the underlying user still has RBAC permissions.
 
-    Event-ID mismatch response depends on client type:
-    - Confidential clients (machine-to-machine): 404 — hides whether the event exists at all.
-    - Non-confidential user tokens: 403 — explicitly tells the user they are denied.
+    A token whose ``event_id`` does not match ``event`` is answered with the
+    same ``404 Event not found`` an unknown slug gets, for every client type,
+    so that a token scoped to one event cannot be used to probe which other
+    events exist (``docs/threat_model.md`` §3).
     """
-    # Fetch the client first so we can tailor the mismatch status code.
-    client = await db.get(OAuthClient, token.client_id)
-    is_confidential = bool(client and client.is_confidential and client.status == "active")
-
     if token.event_id != event.id:
-        if is_confidential:
-            # Confidential clients must not learn whether an event exists.
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
 
-    # Confidential clients manage their own RBAC; no further checks needed.
-    if is_confidential:
+    # Confidential clients manage their own RBAC
+    client = await db.get(OAuthClient, token.client_id)
+    if client and client.is_confidential and client.status == "active":
         return
 
-    # Reject inactive users before any privilege check.
-    # admin_toggle_user_active can deactivate a user without revoking tokens,
-    # so we must gate on is_active before granting the admin bypass.
     from portal.models import User
 
     user = await db.get(User, token.user_id)
-    if not user or not getattr(user, "is_active", True):
+
+    # Account state is security-critical, so read it from the User row rather
+    # than trusting the token: admin_toggle_user_active deactivates a user
+    # without revoking their OAuth tokens, so an unexpired token outlives the
+    # account unless we re-check here, ahead of every bypass below.
+    if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive")
 
-    # Admin bypass — only reached if user is active.
-    if getattr(user, "is_admin", False) or getattr(user, "is_super_admin", False):
+    # Super-admin bypass. ``User`` has no ``is_super_admin`` column — system-wide
+    # admin is ``User.is_admin`` — so this never fires today. Left unchanged on
+    # purpose: widening it to ``is_admin`` would grant every admin an RBAC bypass
+    # on all /api/v1 endpoints, which is out of scope for this endpoint's fix.
+    if getattr(user, "is_super_admin", False):
         return
 
     # Check Event Owner
@@ -116,34 +116,33 @@ async def get_event(
 ):
     """Retrieve event details by slug.
 
-    Authorization order (RBAC before existence):
-    1. Fetch the event by slug (including soft-deleted) to resolve its ID.
-    2. If the token's event_id doesn't match, return 403 immediately — this
-       prevents callers from probing whether an event exists by comparing
-       403 vs 404 responses.
-    3. Only after RBAC passes, enforce the soft-deletion check (404).
-    4. Query owner_id via a correlated subquery against EventMembership.
+    Resource-visibility policy (``docs/threat_model.md`` §3) — every case where
+    the caller may not see the event returns an identical
+    ``404 {"detail": "Event not found"}``:
+
+    * the slug does not exist,
+    * the event is soft-deleted (``deleted_at`` set),
+    * the event exists but the token is scoped to a different event.
+
+    A caller therefore cannot tell "no such event" from "not yours", so a token
+    for one event cannot enumerate other events. 403 is reserved for callers
+    whose token *is* scoped to this event but whose user has since lost access
+    (deactivated account, or no owner/coordinator membership) — they already
+    know the event exists, so there is nothing left to leak.
+
+    ``owner_id`` is resolved from ``EventMembership`` (role ``event_owner``);
+    ``Event`` itself has no ``owner_id`` column.
     """
-    # Step 1: Fetch by slug (no deleted_at filter) so RBAC can run before the
-    # existence check — prevents callers from probing event existence by
-    # comparing 403 vs 404 response codes.
-    event_result = await db.execute(select(Event).where(Event.slug == event_slug))
-    event = event_result.scalar_one_or_none()
+    result = await db.execute(select(Event).where(Event.slug == event_slug, Event.deleted_at.is_(None)))
+    event = result.scalars().first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
 
-    # Step 2: Full RBAC — handles event-id mismatch, confidential-client bypass,
-    # inactive-user rejection, and membership checks.
-    # _verify_token_rbac returns the correct status code (403 or 404) based on
-    # client type, so we call it before the existence/soft-deletion check.
-    if event:
-        await _verify_token_rbac(db, token, event)
+    await _verify_token_rbac(db, token, event)
 
-    # Step 3: Existence check (event missing or soft-deleted → 404).
-    # This is intentionally AFTER RBAC so that a wrong-event token cannot
-    # distinguish "forbidden" from "deleted" events.
-    if not event or event.deleted_at is not None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
-
-    owner_subq = (
+    # Lowest user_id wins so the response is stable when an event has several
+    # event_owner rows. One query — do not loop over memberships here.
+    owner_result = await db.execute(
         select(EventMembership.user_id)
         .where(
             EventMembership.event_id == event.id,
@@ -151,9 +150,7 @@ async def get_event(
         )
         .order_by(EventMembership.user_id)
         .limit(1)
-        .scalar_subquery()
     )
-    owner_result = await db.execute(select(owner_subq.label("owner_id")))
     owner_id = owner_result.scalar_one_or_none()
 
     return {
