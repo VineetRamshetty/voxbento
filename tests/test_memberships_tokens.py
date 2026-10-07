@@ -38,8 +38,18 @@ async def setup_db():
 
 
 @pytest.fixture
-def admin_cookie():
-    return {"user_token": create_user_token(user_id=1, email="admin@example.com", is_admin=True)}
+async def admin_cookie():
+    from portal.database import create_user, get_session
+
+    async with get_session() as s:
+        user = await create_user(
+            s,
+            email="admin@example.com",
+            display_name="Admin",
+            password_hash=hash_password("test-admin-pass"),
+            is_admin=True,
+        )
+    return {"user_token": create_user_token(user_id=user.id, email="admin@example.com", is_admin=True)}
 
 
 def _client():
