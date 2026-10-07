@@ -239,6 +239,74 @@ class TestAdminLogin:
         assert "user_token" not in resp.headers.get("set-cookie", "")
 
     @pytest.mark.anyio
+    async def test_login_when_no_active_admin_account_exists(self, setup_db):
+        """When the database has no active administrators, login fails closed safely."""
+        async with _client() as c:
+            get_resp = await c.get("/admin/login")
+            assert get_resp.status_code == 200
+            assert b'name="email"' in get_resp.content
+
+            resp = await c.post(
+                "/admin/login",
+                data={"email": "nobody@example.com", "password": "any-password"},
+                follow_redirects=False,
+            )
+            assert resp.status_code == 403
+            assert "user_token" not in resp.headers.get("set-cookie", "")
+
+    @pytest.mark.anyio
+    async def test_documented_break_glass_recovery_procedure(self, setup_db):
+        """Verify the documented break-glass recovery SQL procedure promotes an account safely."""
+        from sqlalchemy import text
+
+        from portal.database import create_user, get_session
+
+        async with get_session() as s:
+            await create_user(
+                s,
+                email="operator@example.com",
+                display_name="Operator",
+                password_hash=hash_password("operator-pass"),
+                is_admin=False,
+            )
+
+        async with _client() as c:
+            # 1. Before recovery, regular user cannot access admin login
+            denied_login = await c.post(
+                "/admin/login",
+                data={"email": "operator@example.com", "password": "operator-pass"},
+                follow_redirects=False,
+            )
+            assert denied_login.status_code == 403
+
+            # 2. Execute documented break-glass recovery SQL from docs/admin-password-removal-migration.md
+            async with get_session() as s:
+                await s.execute(text("UPDATE users SET is_admin = 1 WHERE email = 'operator@example.com'"))
+                await s.commit()
+
+            # 3. After running the recovery SQL, user signs in successfully immediately
+            allowed_login = await c.post(
+                "/admin/login",
+                data={"email": "operator@example.com", "password": "operator-pass"},
+                follow_redirects=False,
+            )
+            assert allowed_login.status_code == 303
+            assert allowed_login.headers["location"] == "/admin/"
+            cookie_header = allowed_login.headers.get("set-cookie", "")
+            assert "user_token" in cookie_header
+
+            # 4. Promoted user can now access the admin panel
+            token_val = None
+            for cookie_part in cookie_header.split(";"):
+                part = cookie_part.strip()
+                if part.startswith("user_token="):
+                    token_val = part.split("=", 1)[1]
+                    break
+            assert token_val is not None
+            dashboard = await c.get("/admin/", cookies={"user_token": token_val})
+            assert dashboard.status_code == 200
+
+    @pytest.mark.anyio
     async def test_login_preserves_password_whitespace(self, setup_db):
         """Passwords are compared verbatim; they must not be stripped."""
         from portal.database import create_user, get_session
