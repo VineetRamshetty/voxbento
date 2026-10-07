@@ -182,6 +182,75 @@ class TestAdminLogin:
         assert "user_token" not in resp.headers.get("set-cookie", "")
 
     @pytest.mark.anyio
+    async def test_login_rejects_inactive_admin(self, setup_db):
+        """An administrator whose account has been deactivated cannot sign in."""
+        from portal.database import create_user, get_session, update_user_active
+
+        async with get_session() as s:
+            user = await create_user(
+                s,
+                email="inactive-admin@example.com",
+                display_name="Inactive Admin",
+                password_hash=hash_password("test-admin-pass"),
+                is_admin=True,
+            )
+            await update_user_active(s, user.id, is_active=False)
+
+        async with _client() as c:
+            resp = await c.post(
+                "/admin/login",
+                data={"email": "inactive-admin@example.com", "password": "test-admin-pass"},
+                follow_redirects=False,
+            )
+        assert resp.status_code == 403
+        assert "user_token" not in resp.headers.get("set-cookie", "")
+
+    @pytest.mark.anyio
+    async def test_login_preserves_password_whitespace(self, setup_db):
+        """Passwords are compared verbatim; they must not be stripped."""
+        from portal.database import create_user, get_session
+
+        async with get_session() as s:
+            await create_user(
+                s,
+                email="spacey-admin@example.com",
+                display_name="Spacey Admin",
+                password_hash=hash_password(" padded-pass "),
+                is_admin=True,
+            )
+
+        async with _client() as c:
+            stripped = await c.post(
+                "/admin/login",
+                data={"email": "spacey-admin@example.com", "password": "padded-pass"},
+                follow_redirects=False,
+            )
+            verbatim = await c.post(
+                "/admin/login",
+                data={"email": "spacey-admin@example.com", "password": " padded-pass "},
+                follow_redirects=False,
+            )
+
+        # The trimmed password must not match a credential whose spaces are real.
+        assert stripped.status_code == 403
+        # The exact credential still signs in.
+        assert verbatim.status_code == 303
+        assert verbatim.headers["location"] == "/admin/"
+        assert "user_token" in verbatim.headers.get("set-cookie", "")
+
+    @pytest.mark.anyio
+    async def test_logout_clears_current_and_legacy_cookies(self):
+        """Logout must clear both the new user_token and the legacy admin_token."""
+        async with _client() as c:
+            resp = await c.get("/admin/logout", follow_redirects=False)
+
+        assert resp.status_code == 303
+        cleared = {header.split("=", 1)[0].strip().lower() for header in resp.headers.get_list("set-cookie")}
+        assert "user_token" in cleared
+        assert "admin_token" in cleared
+        assert "session_token" in cleared
+
+    @pytest.mark.anyio
     async def test_logout_clears_cookie(self):
         async with _client() as c:
             resp = await c.get("/admin/logout", follow_redirects=False)

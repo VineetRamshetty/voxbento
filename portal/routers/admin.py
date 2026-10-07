@@ -252,7 +252,9 @@ async def admin_login_page(request: Request):
 async def admin_login_submit(request: Request):
     form = await request.form()
     email = (form.get("email", "") or "").strip().lower()
-    password = (form.get("password", "") or "").strip()
+    # Passwords are compared verbatim: never strip them. Leading/trailing
+    # whitespace may be part of the stored credential (matches /login).
+    password = form.get("password", "") or ""
 
     if not email or not password:
         return templates.TemplateResponse(
