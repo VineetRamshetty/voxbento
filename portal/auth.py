@@ -204,7 +204,15 @@ async def require_room_event_access(
 
 
 async def require_admin(request: Request) -> None:
-    """FastAPI dependency that guards admin routes."""
+    """FastAPI dependency that guards shared management routes.
+
+    Workspace requests use the event-owner policy. Legacy admin paths retain
+    their existing scoped event-owner and room-coordinator compatibility.
+    Returns None on success; raises HTTP 403 on failure.
+    """
+    if getattr(request.state, "is_workspace", False):
+        await require_event_owner(request)
+        return
 
     event_id_str = request.path_params.get("event_id")
     event_id = int(event_id_str) if event_id_str and event_id_str.isdigit() else None
@@ -265,7 +273,15 @@ async def require_super_admin(request: Request) -> None:
 
 
 async def require_event_owner(request: Request) -> None:
-    """FastAPI dependency that guards event owner routes."""
+    """FastAPI dependency that guards event owner routes.
+
+    Checks for a valid ``user_token`` whose owner currently has ``is_admin=True``,
+    or an event_owner membership for the specified event, in the database.
+    Routes without an ``event_id`` are general workspace entry points and accept
+    a user who owns at least one event; event-scoped routes require ownership of
+    that specific event.
+    Returns None on success; raises HTTP 403 on failure.
+    """
     event_id_str = request.path_params.get("event_id")
     event_id = int(event_id_str) if event_id_str and event_id_str.isdigit() else None
     room_id_str = request.path_params.get("room_id")
@@ -331,6 +347,12 @@ async def get_admin_flags(request: Request, event_id: int | None = None, room_id
                     async with get_session() as db_session:
                         memberships = await list_memberships_for_user(db_session, user.id)
                         rms = await list_room_memberships_for_user(db_session, user.id)
+                        if event_id is None and room_id is None:
+                            if any((m.role == "event_owner" for m in memberships)):
+                                flags["is_event_owner"] = True
+                                flags["is_room_coordinator"] = True
+                            if any((rm.role == "room_coordinator" for rm in rms)):
+                                flags["is_room_coordinator"] = True
                         if event_id is not None:
                             if any((m.event_id == event_id and m.role == "event_owner" for m in memberships)):
                                 flags["is_event_owner"] = True
