@@ -1,4 +1,4 @@
-﻿"""Unit tests for the helpers extracted from the home route handler.
+"""Unit tests for the helpers extracted from the home route handler.
 
 Covers:
 - _build_my_booths: live/offline booth status, full dict shape
@@ -281,7 +281,7 @@ class TestHomeRouteBehavior:
         assert response.status_code == 200
         assert b"Your Assigned Booths" in response.content
         assert b"Integration Event" in response.content
-        assert b'href="/admin/events/"' in response.content
+        assert b'href="/account"' in response.content
         assert b'href="/interpreter"' in response.content
 
     @pytest.mark.anyio
