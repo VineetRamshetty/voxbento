@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,6 +16,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from portal.auth import require_admin
 from portal.config import settings
+from portal.rate_limit import auth_rate_limiter, token_rate_limiter
 from portal.routers.admin import router as admin_router
 from portal.routers.api import router as api_router
 from portal.routers.api_v1 import router as api_v1_router
@@ -33,6 +36,17 @@ from portal.workspace_routing import WorkspaceRoutingMiddleware
 _BASE_DIR = Path(__file__).resolve().parent
 
 templates = Jinja2Templates(directory=str(_BASE_DIR / "portal" / "templates"))
+
+
+async def _rate_limit_cleanup_loop(interval_seconds: float = 300.0) -> None:
+    """Periodically purge expired rate limit entries to prevent unbounded memory growth."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await auth_rate_limiter.cleanup()
+            await token_rate_limiter.cleanup()
+        except Exception as e:
+            logging.error(f"Rate limit cleanup error: {e}", exc_info=True)
 
 
 @asynccontextmanager
@@ -58,24 +72,25 @@ async def lifespan(app: FastAPI):
         finally:
             dg._generating = False
 
-    import asyncio
-
     import portal.webhooks.worker as _webhook_worker_mod
 
     # Reference via module attribute so test-time monkey-patching of
     # portal.webhooks.worker.webhook_worker_loop is respected.
     webhook_task = asyncio.create_task(_webhook_worker_mod.webhook_worker_loop())
+    rate_limit_cleanup_task = asyncio.create_task(_rate_limit_cleanup_loop())
 
     dg.track_task(asyncio.create_task(_gen()))
 
     logging.getLogger("uvicorn.access").addFilter(_UvicornTokenRedactor())
     logging.getLogger("uvicorn.access").addFilter(_HealthCheckFilter())
     yield
-    import contextlib
 
     webhook_task.cancel()
+    rate_limit_cleanup_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await webhook_task
+    with contextlib.suppress(asyncio.CancelledError):
+        await rate_limit_cleanup_task
 
     if pg.shared_http_client:
         await pg.shared_http_client.aclose()
