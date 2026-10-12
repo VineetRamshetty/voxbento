@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -42,11 +41,11 @@ async def _rate_limit_cleanup_loop(interval_seconds: float = 300.0) -> None:
     """Periodically purge expired rate limit entries to prevent unbounded memory growth."""
     while True:
         await asyncio.sleep(interval_seconds)
-        try:
-            await auth_rate_limiter.cleanup()
-            await token_rate_limiter.cleanup()
-        except Exception as e:
-            logging.error(f"Rate limit cleanup error: {e}", exc_info=True)
+        for name, limiter in (("auth", auth_rate_limiter), ("token", token_rate_limiter)):
+            try:
+                await limiter.cleanup()
+            except Exception:
+                logging.exception("Rate limit cleanup error (%s)", name)
 
 
 @asynccontextmanager
@@ -87,10 +86,7 @@ async def lifespan(app: FastAPI):
 
     webhook_task.cancel()
     rate_limit_cleanup_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await webhook_task
-    with contextlib.suppress(asyncio.CancelledError):
-        await rate_limit_cleanup_task
+    await asyncio.gather(webhook_task, rate_limit_cleanup_task, return_exceptions=True)
 
     if pg.shared_http_client:
         await pg.shared_http_client.aclose()
