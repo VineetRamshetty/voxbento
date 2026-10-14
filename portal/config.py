@@ -85,8 +85,9 @@ class Settings(BaseSettings):
 
         Note for upgrades: Existing production deployments that previously ran
         with a weak or short secret must configure a 32+ character random
-        SECRET_KEY before starting. If stored credentials were tied to the old
-        secret, reissue them after rotation.
+        JWT_SECRET (or SECRET_KEY if JWT_SECRET is unset) before starting.
+        If stored credentials were tied to the old secret, reissue them after
+        rotation.
         """
         if self.debug:
             return
