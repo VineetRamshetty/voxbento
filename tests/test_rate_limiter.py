@@ -78,7 +78,7 @@ class TestInMemoryRateLimiterBasic:
         assert await limiter.is_rate_limited("client1") is True
 
         # Simulate expiration of the sliding window
-        limiter._store["client1"] = (3, time.time() - 1)
+        limiter._store["client1"] = (limiter.window_seconds, [time.time() - 100])
         assert await limiter.is_rate_limited("client1") is False
 
 
@@ -90,8 +90,8 @@ class TestInMemoryRateLimiterCleanup:
         await limiter.is_rate_limited("user1")
         await limiter.is_rate_limited("user2")
         now = time.time()
-        limiter._store["user1"] = (1, now - 10)
-        limiter._store["user2"] = (2, now - 5)
+        limiter._store["user1"] = (limiter.window_seconds, [now - 100])
+        limiter._store["user2"] = (limiter.window_seconds, [now - 100])
 
         assert len(limiter._store) == 2
         await limiter.cleanup()
@@ -104,15 +104,15 @@ class TestInMemoryRateLimiterCleanup:
         await limiter.is_rate_limited("expired_user")
         await limiter.is_rate_limited("active_user")
         now = time.time()
-        limiter._store["expired_user"] = (1, now - 10)
-        limiter._store["active_user"] = (2, now + 100)
+        limiter._store["expired_user"] = (limiter.window_seconds, [now - 100])
+        limiter._store["active_user"] = (limiter.window_seconds, [now])
 
         assert len(limiter._store) == 2
         await limiter.cleanup()
         assert len(limiter._store) == 1
         assert "expired_user" not in limiter._store
         assert "active_user" in limiter._store
-        assert limiter._store["active_user"] == (2, now + 100)
+        assert limiter._store["active_user"] == (limiter.window_seconds, [now])
 
     async def test_cleanup_on_empty_store_is_a_no_op(self, limiter: InMemoryRateLimiter):
         """Verify that cleanup() completes safely on an empty store."""
@@ -125,8 +125,8 @@ class TestInMemoryRateLimiterCleanup:
         await limiter.is_rate_limited("expired_1")
         await limiter.is_rate_limited("active_1")
         now = time.time()
-        limiter._store["expired_1"] = (1, now - 10)
-        limiter._store["active_1"] = (1, now + 100)
+        limiter._store["expired_1"] = (limiter.window_seconds, [now - 100])
+        limiter._store["active_1"] = (limiter.window_seconds, [now])
 
         # First cleanup call removes expired entry
         await limiter.cleanup()
@@ -144,7 +144,7 @@ class TestInMemoryRateLimiterCleanup:
         """Verify that cleanup() does not corrupt or alter rate limit evaluation for active keys."""
         await limiter.is_rate_limited("user")
         now = time.time()
-        limiter._store["user"] = (1, now + 100)
+        limiter._store["user"] = (limiter.window_seconds, [now])
         await limiter.cleanup()
 
         assert await limiter.is_rate_limited("user") is False
@@ -158,10 +158,10 @@ class TestRateLimitCleanupLoop:
     async def test_cleanup_loop_purges_global_limiters(self):
         """Verify that the background cleanup loop purges expired keys across global limiters."""
         now = time.time()
-        auth_rate_limiter._store["ip_expired"] = (1, now - 10)
-        auth_rate_limiter._store["ip_active"] = (1, now + 60)
-        token_rate_limiter._store["token_expired"] = (1, now - 10)
-        token_rate_limiter._store["token_active"] = (1, now + 60)
+        auth_rate_limiter._store["ip_expired"] = (auth_rate_limiter.window_seconds, [now - 100])
+        auth_rate_limiter._store["ip_active"] = (auth_rate_limiter.window_seconds, [now])
+        token_rate_limiter._store["token_expired"] = (token_rate_limiter.window_seconds, [now - 100])
+        token_rate_limiter._store["token_active"] = (token_rate_limiter.window_seconds, [now])
 
         task = asyncio.create_task(_rate_limit_cleanup_loop(interval_seconds=0.01))
         try:

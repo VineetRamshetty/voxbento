@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from portal import program_ingest
+from portal import meeting_source, program_ingest
 from portal.auth import require_admin
 from portal.config import settings
 from portal.rate_limit import auth_rate_limiter, token_rate_limiter
@@ -25,6 +25,7 @@ from portal.routers.demo import router as demo_router
 from portal.routers.developer import router as developer_router
 from portal.routers.interpreter import router as interpreter_router
 from portal.routers.listener import router as listener_router
+from portal.routers.meeting_source import router as meeting_source_router
 from portal.routers.oauth import router as oauth_router
 from portal.routers.program_ingest import router as program_ingest_router
 from portal.routers.public import router as public_router
@@ -80,6 +81,7 @@ async def lifespan(app: FastAPI):
     webhook_task = asyncio.create_task(_webhook_worker_mod.webhook_worker_loop())
     rate_limit_cleanup_task = asyncio.create_task(_rate_limit_cleanup_loop())
     ingest_task = asyncio.create_task(program_ingest.reconcile_loop()) if settings.program_ingest_enabled else None
+    meeting_task = asyncio.create_task(meeting_source.reconcile_loop())
 
     dg.track_task(asyncio.create_task(_gen()))
 
@@ -87,7 +89,7 @@ async def lifespan(app: FastAPI):
     logging.getLogger("uvicorn.access").addFilter(_HealthCheckFilter())
     yield
 
-    tasks_to_cancel = [webhook_task, rate_limit_cleanup_task]
+    tasks_to_cancel = [webhook_task, rate_limit_cleanup_task, meeting_task]
     if ingest_task:
         tasks_to_cancel.append(ingest_task)
     for task in tasks_to_cancel:
@@ -200,6 +202,7 @@ app.include_router(api_v1_router)
 
 app.include_router(admin_router)
 app.include_router(program_ingest_router)
+app.include_router(meeting_source_router)
 
 app.include_router(demo_router)
 
