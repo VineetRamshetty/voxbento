@@ -85,11 +85,30 @@ class Settings(BaseSettings):
         """
         if self.debug:
             return
-        weak_defaults = {"change-me", "", "secret", "your-secret-key"}
+        weak_defaults = {
+            "change-me",
+            "",
+            "secret",
+            "your-secret-key",
+            "admin",
+            "password",
+            "123456",
+            "qwerty",
+            "letmein",
+            "changeme",
+            "test",
+            "1234567890",
+        }
         if self.effective_jwt_secret in weak_defaults:
             raise RuntimeError(
                 "SECRET_KEY (or JWT_SECRET) is set to a known-weak default value. "
                 "Set a strong random value before running in production. "
+                "Generate one with: openssl rand -hex 32"
+            )
+        if len(self.effective_jwt_secret) < 32:
+            raise RuntimeError(
+                "SECRET_KEY (or JWT_SECRET) is too short for production use. "
+                "It must be at least 32 characters. "
                 "Generate one with: openssl rand -hex 32"
             )
         if not self.mediamtx_auth_hook_secret:

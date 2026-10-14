@@ -1716,6 +1716,46 @@ def test_missing_media_auth_hook_secret_raises_in_production():
         s.validate_production_secrets()
 
 
+def test_common_password_secret_raises_in_production():
+    from portal.config import Settings
+
+    s = Settings(debug=False, secret_key="admin", jwt_secret="")
+    with pytest.raises(RuntimeError, match="SECRET_KEY"):
+        s.validate_production_secrets()
+
+
+def test_short_secret_raises_in_production():
+    from portal.config import Settings
+
+    s = Settings(
+        debug=False,
+        secret_key="short-key-not-in-weak-defaults",
+        jwt_secret="",
+        mediamtx_auth_hook_secret="media-hook-secret",
+    )
+    with pytest.raises(RuntimeError, match="too short"):
+        s.validate_production_secrets()
+
+
+def test_short_secret_allowed_in_debug_mode():
+    from portal.config import Settings
+
+    s = Settings(debug=True, secret_key="tooshort", jwt_secret="")
+    s.validate_production_secrets()  # must not raise
+
+
+def test_exactly_32_char_secret_passes_production():
+    from portal.config import Settings
+
+    s = Settings(
+        debug=False,
+        secret_key="a" * 32,
+        jwt_secret="",
+        mediamtx_auth_hook_secret="media-hook-secret",
+    )
+    s.validate_production_secrets()  # must not raise
+
+
 # ── Unified error pages (PR #263) ──────────────────────────────────────
 
 
