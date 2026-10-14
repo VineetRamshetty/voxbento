@@ -13,115 +13,20 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from portal.auth import get_admin_flags, get_current_user
-from portal.booth_identity import make_booth_id
 from portal.database import (
     get_session,
-    list_all_booths_for_events,
     list_booth_memberships_for_user,
-    list_events,
     list_memberships_for_user,
     list_room_memberships_for_user,
 )
 from portal.email_sender import send_demo_request_email
-from portal.globals import _JS_CACHE_BUST, booths
+from portal.globals import _JS_CACHE_BUST
 from portal.utils import _check_mediamtx
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
 
 router = APIRouter()
-
-
-def _build_my_booths(bms: list) -> list[dict]:
-    """Build the list of booth cards for all booth memberships belonging to the logged-in user on the home page.
-
-    Extracted from ``home()`` to reduce its cyclomatic complexity.
-    """
-    result = []
-    for bm in bms:
-        bid = make_booth_id(bm.booth.event.slug, bm.booth.room_id, bm.booth.language_code)
-        mem_booth = booths.get_booth_sync(bid)
-        is_live = mem_booth is not None and mem_booth.ingest_status == "connected"
-        result.append(
-            {
-                "membership": bm,
-                "booth_id": bid,
-                "is_live": is_live,
-                "event_name": bm.booth.event.display_name if bm.booth.event else "Unknown Event",
-                "room_name": bm.booth.room.display_name if bm.booth.room else "Unknown Room",
-                "language_name": bm.booth.language_name,
-                "event_slug": bm.booth.event.slug if bm.booth.event else "",
-                "language_code": bm.booth.language_code,
-            }
-        )
-    return result
-
-
-def _build_event_data(
-    events: list,
-    booths_by_event: dict,
-    current_user: dict | None,
-    user_event_roles: dict,
-    user_booth_roles: dict,
-) -> list[dict]:
-    """Build the per-event context list rendered on the home page.
-
-    Groups each event's booths by room, computes live status and interpret
-    permission for every booth, and returns the structured list expected by
-    ``home.html``.
-
-    Extracted from ``home()`` to reduce its cyclomatic complexity.
-    """
-    event_data = []
-    for ev in events:
-        db_booths = booths_by_event.get(ev.id, [])
-
-        # Group booths by room so the template can show room headers
-        rooms_dict: dict[int, dict] = {}
-        for b in db_booths:
-            bid = make_booth_id(ev.slug, b.room_id, b.language_code)
-            mem_booth = booths.get_booth_sync(bid)
-            is_live = mem_booth is not None and mem_booth.ingest_status == "connected"
-
-            can_interpret = _can_user_interpret(current_user, ev.id, b.id, user_event_roles, user_booth_roles)
-
-            if b.room_id not in rooms_dict:
-                rooms_dict[b.room_id] = {
-                    "room_name": b.room.display_name if b.room else "Unknown Room",
-                    "booths": [],
-                }
-            rooms_dict[b.room_id]["booths"].append(
-                {"db": b, "booth_id": bid, "is_live": is_live, "can_interpret": can_interpret}
-            )
-
-        rooms_with_booths = list(rooms_dict.values())
-        all_booth_statuses = [bs for r in rooms_with_booths for bs in r["booths"]]
-        event_data.append(
-            {
-                "event": ev,
-                "rooms": rooms_with_booths,
-                "booths": all_booth_statuses,  # kept for live_count
-                "live_count": sum(1 for bs in all_booth_statuses if bs["is_live"]),
-            }
-        )
-    return event_data
-
-
-def _can_user_interpret(
-    current_user: dict | None,
-    event_id: int,
-    booth_id: int,
-    user_event_roles: dict,
-    user_booth_roles: dict,
-) -> bool:
-    """Return True if the current user may interpret in the given booth."""
-    if not current_user:
-        return False
-    if current_user.get("is_admin", False):
-        return True
-    if user_event_roles.get(event_id) == "event_owner":
-        return True
-    return user_booth_roles.get(booth_id) == "interpreter"
 
 
 @router.get("/")
@@ -131,48 +36,30 @@ async def home(request: Request):
     if not current_user and admin_flags.get("is_super_admin"):
         current_user = {"email": "admin", "display_name": "Admin", "is_admin": True}
 
-    my_booths: list[dict] = []
-    event_data: list[dict] = []
     management_home = "/admin/" if current_user and current_user.get("is_admin") else "/account"
 
-    try:
-        async with get_session() as session:
-            events = await list_events(session)
-
-            user_event_roles: dict = {}
-            user_booth_roles: dict = {}
-            if current_user and current_user.get("sub"):
+    if current_user and current_user.get("sub") and not current_user.get("is_admin"):
+        try:
+            async with get_session() as session:
                 uid = int(current_user["sub"])
                 ems = await list_memberships_for_user(session, uid)
-                user_event_roles = {em.event_id: em.role for em in ems}
                 room_memberships = await list_room_memberships_for_user(session, uid)
-                if not current_user.get("is_admin"):
-                    if any(em.role == "event_owner" for em in ems):
-                        management_home = "/workspace/"
-                    elif any(rm.role == "room_coordinator" for rm in room_memberships):
-                        management_home = "/mission-control/"
-
-                bms = await list_booth_memberships_for_user(session, uid)
-                user_booth_roles = {bm.booth_id: bm.role for bm in bms}
-                my_booths = _build_my_booths(bms)
-
-            booths_by_event = await list_all_booths_for_events(session, [ev.id for ev in events])
-            event_data = _build_event_data(
-                events, booths_by_event, current_user, user_event_roles, user_booth_roles
-            )
-    except Exception as _exc:
-        logging.getLogger(__name__).warning("home() DB error: %s", _exc, exc_info=True)
-        event_data = []
-        my_booths = []
+                booth_memberships = await list_booth_memberships_for_user(session, uid)
+            if any(em.role == "event_owner" for em in ems):
+                management_home = "/workspace/"
+            elif any(rm.role == "room_coordinator" for rm in room_memberships):
+                management_home = "/mission-control/"
+            elif booth_memberships:
+                management_home = "/interpreter"
+        except Exception as _exc:
+            logging.getLogger(__name__).warning("home() DB error: %s", _exc, exc_info=True)
 
     return templates.TemplateResponse(
         request=request,
         name="home.html",
         context={
-            "events": event_data,
             "current_user": current_user,
             "management_home": management_home,
-            "my_booths": my_booths,
             "js_version": _JS_CACHE_BUST,
         },
     )
