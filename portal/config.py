@@ -82,6 +82,11 @@ class Settings(BaseSettings):
 
         Called once at application startup. No-op in debug mode so local
         development works without configuring a SECRET_KEY.
+
+        Note for upgrades: Existing production deployments that previously ran
+        with a weak or short secret must configure a 32+ character random
+        SECRET_KEY before starting. If stored credentials were tied to the old
+        secret, reissue them after rotation.
         """
         if self.debug:
             return
@@ -109,6 +114,12 @@ class Settings(BaseSettings):
             raise RuntimeError(
                 "SECRET_KEY (or JWT_SECRET) is too short for production use. "
                 "It must be at least 32 characters. "
+                "Generate one with: openssl rand -hex 32"
+            )
+        if len(set(self.effective_jwt_secret)) < 8:
+            raise RuntimeError(
+                "SECRET_KEY (or JWT_SECRET) lacks sufficient character diversity. "
+                "Set a strong random value before running in production. "
                 "Generate one with: openssl rand -hex 32"
             )
         if not self.mediamtx_auth_hook_secret:
