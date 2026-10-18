@@ -260,7 +260,11 @@ class TestSubprocessManager(unittest.TestCase):
             self.assertTrue(first_call_event.wait(timeout=1.0))
             t2.start()
 
-            # Release first call so both threads proceed and contend
+            # Confirm t2 is blocked by lock contention and has not entered Popen yet
+            time.sleep(0.05)
+            self.assertEqual(len(procs_created), 1)
+
+            # Release first call so t1 finishes and t2 proceeds
             release_first_event.set()
             t1.join(timeout=2.0)
             t2.join(timeout=2.0)
