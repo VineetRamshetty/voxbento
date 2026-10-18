@@ -234,6 +234,8 @@ class TestSubprocessManager(unittest.TestCase):
         """Verify concurrent start_room calls for the same room are safely serialized."""
         key = "event-1"
         procs_created = []
+        first_call_event = threading.Event()
+        release_first_event = threading.Event()
 
         def fake_popen(*args, **kwargs):
             mock_p = MagicMock()
@@ -242,6 +244,9 @@ class TestSubprocessManager(unittest.TestCase):
             mock_p.poll.return_value = None
             mock_p.wait.return_value = 0
             procs_created.append(mock_p)
+            if len(procs_created) == 1:
+                first_call_event.set()
+                release_first_event.wait(timeout=2.0)
             return mock_p
 
         with patch.object(bot.subprocess, "Popen", side_effect=fake_popen):
@@ -252,13 +257,23 @@ class TestSubprocessManager(unittest.TestCase):
                 target=lambda: self.mgr.start_room("event", 1, "https://meet2.com", "rtsp://mtx:8554")
             )
             t1.start()
+            self.assertTrue(first_call_event.wait(timeout=1.0))
             t2.start()
+
+            # Release first call so both threads proceed and contend
+            release_first_event.set()
             t1.join(timeout=2.0)
             t2.join(timeout=2.0)
+
+            self.assertFalse(t1.is_alive())
+            self.assertFalse(t2.is_alive())
+            self.assertEqual(len(procs_created), 2)
+            procs_created[0].terminate.assert_called_once()
 
             self.assertIn(key, self.mgr.rooms)
             self.mgr.wait_for_all_stops(timeout=2.0)
             self.assertEqual(len(self.mgr.rooms), 1)
+            self.assertEqual(self.mgr.rooms[key], procs_created[1])
 
 
 class TestRequestHandlerStopEndpoint(unittest.TestCase):
