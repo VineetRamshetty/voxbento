@@ -37,8 +37,8 @@ def _wait_for_proc(proc: subprocess.Popen, label: str) -> None:
             logger.error(f"Unexpected error stopping subprocess for {label}: {exc}")
             try:
                 proc.kill()
-            except Exception:
-                pass
+            except Exception as kill_exc:
+                logger.debug(f"Kill failed for {label}: {kill_exc}")
 
 
 class SubprocessManager:
@@ -51,24 +51,26 @@ class SubprocessManager:
         self.room_failures: Dict[str, str] = {}
         self.room_meta: Dict[str, dict] = {}
         self.stopping_threads: Dict[str, threading.Thread] = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     def start_room(self, event_slug: str, room_id: int, jitsi_url: str, mediamtx_rtsp_base: str):
         """Start a floor-bot browser subprocess for the given room, waiting for any in-flight teardown."""
         process_key = f"{event_slug}-{room_id}"
         while True:
+            to_join = None
             with self.lock:
                 stop_thread = self.stopping_threads.get(process_key)
                 if stop_thread and stop_thread.is_alive():
                     to_join = stop_thread
+                elif process_key in self.rooms:
+                    self._stop_room_async_locked(process_key)
+                    to_join = self.stopping_threads.get(process_key)
                 else:
                     break
-            to_join.join()
+            if to_join and to_join.is_alive():
+                to_join.join()
 
         with self.lock:
-            if process_key in self.rooms:
-                self.stop_room_locked(process_key)
-
             logger.info(f"Starting subprocess for event: {event_slug}, room: {room_id}")
             env = os.environ.copy()
             env["BOT_EVENT_SLUG"] = event_slug
@@ -410,28 +412,31 @@ raise SystemExit(asyncio.run(run_capture()))
             _wait_for_proc(proc, process_key)
             self.room_states[process_key] = "stopped"
 
+    def _stop_room_async_locked(self, process_key: str) -> None:
+        if process_key not in self.rooms:
+            return
+        logger.info(f"Terminating subprocess for {process_key} in background")
+        self.room_states[process_key] = "stopping"
+        proc = self.rooms.pop(process_key)
+        self.room_failures.pop(process_key, None)
+        self.room_meta.pop(process_key, None)
+
+        def _teardown():
+            try:
+                _wait_for_proc(proc, process_key)
+            finally:
+                with self.lock:
+                    self.room_states[process_key] = "stopped"
+                    self.stopping_threads.pop(process_key, None)
+
+        t = threading.Thread(target=_teardown, daemon=True)
+        self.stopping_threads[process_key] = t
+        t.start()
+
     def stop_room_async(self, process_key: str) -> None:
         """Eagerly remove room from active tracking and perform teardown in a background daemon thread."""
         with self.lock:
-            if process_key not in self.rooms:
-                return
-            logger.info(f"Terminating subprocess for {process_key} in background")
-            self.room_states[process_key] = "stopping"
-            proc = self.rooms.pop(process_key)
-            self.room_failures.pop(process_key, None)
-            self.room_meta.pop(process_key, None)
-
-            def _teardown():
-                try:
-                    _wait_for_proc(proc, process_key)
-                finally:
-                    with self.lock:
-                        self.room_states[process_key] = "stopped"
-                        self.stopping_threads.pop(process_key, None)
-
-            t = threading.Thread(target=_teardown, daemon=True)
-            self.stopping_threads[process_key] = t
-            t.start()
+            self._stop_room_async_locked(process_key)
 
     def stop_room(self, process_key: str):
         """Synchronously stop a room, awaiting any active background teardown."""

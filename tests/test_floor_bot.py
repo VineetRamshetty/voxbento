@@ -163,29 +163,72 @@ class TestSubprocessManager(unittest.TestCase):
         self.mgr.stop_room_async(key)
 
         started = False
+        mock_p = MagicMock()
+        mock_p.stdout.readline.return_value = ""
+        mock_p.stderr.readline.return_value = ""
 
-        def mock_start():
-            nonlocal started
-            with patch("subprocess.Popen") as mock_popen:
-                mock_p = MagicMock()
-                mock_p.stdout.readline.return_value = ""
-                mock_p.stderr.readline.return_value = ""
-                mock_popen.return_value = mock_p
+        with patch.object(bot.subprocess, "Popen", return_value=mock_p):
+            def mock_start():
+                nonlocal started
                 self.mgr.start_room("event", 1, "https://meet.example.com", "rtsp://mediamtx:8554")
                 started = True
 
-        t = threading.Thread(target=mock_start)
-        t.start()
+            t = threading.Thread(target=mock_start)
+            t.start()
 
-        # Before teardown completes, started should still be False
-        time.sleep(0.05)
-        self.assertFalse(started)
+            # Before teardown completes, started should still be False
+            time.sleep(0.05)
+            self.assertFalse(started)
 
-        # Release teardown
-        release_wait.set()
-        t.join(timeout=2.0)
-        self.assertTrue(started)
-        self.assertIn(key, self.mgr.rooms)
+            # Release teardown
+            release_wait.set()
+            t.join(timeout=2.0)
+            self.assertTrue(started)
+            self.assertIn(key, self.mgr.rooms)
+
+    def test_start_room_restarts_running_room_asynchronously(self):
+        """Verify start_room detaches an already running room without holding lock during wait."""
+        old_proc = MagicMock(spec=subprocess.Popen)
+        old_proc.poll.return_value = None
+        release_wait = threading.Event()
+
+        def slow_wait(*args, **kwargs):
+            release_wait.wait(timeout=2.0)
+            return 0
+
+        old_proc.wait.side_effect = slow_wait
+
+        key = "event-1"
+        self.mgr.rooms[key] = old_proc
+        self.mgr.room_states[key] = "in_meeting"
+
+        started = False
+        mock_p = MagicMock()
+        mock_p.stdout.readline.return_value = ""
+        mock_p.stderr.readline.return_value = ""
+
+        with patch.object(bot.subprocess, "Popen", return_value=mock_p):
+            def mock_start():
+                nonlocal started
+                self.mgr.start_room("event", 1, "https://meet.example.com", "rtsp://mediamtx:8554")
+                started = True
+
+            t = threading.Thread(target=mock_start)
+            t.start()
+
+            # While old_proc is tearing down, manager.lock should be free for other callers
+            time.sleep(0.05)
+            self.assertFalse(started)
+            acquired = self.mgr.lock.acquire(timeout=0.5)
+            self.assertTrue(acquired)
+            self.mgr.lock.release()
+
+            # Release teardown
+            release_wait.set()
+            t.join(timeout=2.0)
+            self.assertTrue(started)
+            self.assertIn(key, self.mgr.rooms)
+            self.assertNotEqual(self.mgr.rooms[key], old_proc)
 
 
 class TestRequestHandlerStopEndpoint(unittest.TestCase):
