@@ -7,7 +7,7 @@ import os
 import re
 import subprocess  # nosec B404
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict
 
 logging.basicConfig(level=logging.INFO)
@@ -20,17 +20,25 @@ SECRET_VALUE = re.compile(
 
 
 def _wait_for_proc(proc: subprocess.Popen, label: str) -> None:
+    """Terminate and wait for a subprocess, falling back to SIGKILL on timeout."""
     if proc.poll() is None:
-        proc.terminate()
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            logger.warning(f"Graceful stop timed out for {label}; sending SIGKILL")
-            proc.kill()
+            proc.terminate()
             try:
-                proc.wait(timeout=3)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                logger.error(f"Subprocess for {label} did not exit after SIGKILL")
+                logger.warning(f"Graceful stop timed out for {label}; sending SIGKILL")
+                proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    logger.error(f"Subprocess for {label} did not exit after SIGKILL")
+        except Exception as exc:
+            logger.error(f"Unexpected error stopping subprocess for {label}: {exc}")
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 class SubprocessManager:
@@ -46,12 +54,16 @@ class SubprocessManager:
         self.lock = threading.Lock()
 
     def start_room(self, event_slug: str, room_id: int, jitsi_url: str, mediamtx_rtsp_base: str):
+        """Start a floor-bot browser subprocess for the given room, waiting for any in-flight teardown."""
         process_key = f"{event_slug}-{room_id}"
-        stop_thread = None
-        with self.lock:
-            stop_thread = self.stopping_threads.get(process_key)
-        if stop_thread and stop_thread.is_alive():
-            stop_thread.join()
+        while True:
+            with self.lock:
+                stop_thread = self.stopping_threads.get(process_key)
+                if stop_thread and stop_thread.is_alive():
+                    to_join = stop_thread
+                else:
+                    break
+            to_join.join()
 
         with self.lock:
             if process_key in self.rooms:
@@ -388,6 +400,7 @@ raise SystemExit(asyncio.run(run_capture()))
             self.rooms[process_key] = proc
 
     def stop_room_locked(self, process_key: str):
+        """Synchronously terminate and wait for a room subprocess under lock."""
         if process_key in self.rooms:
             logger.info(f"Terminating subprocess for {process_key}")
             self.room_states[process_key] = "stopping"
@@ -398,6 +411,7 @@ raise SystemExit(asyncio.run(run_capture()))
             self.room_states[process_key] = "stopped"
 
     def stop_room_async(self, process_key: str) -> None:
+        """Eagerly remove room from active tracking and perform teardown in a background daemon thread."""
         with self.lock:
             if process_key not in self.rooms:
                 return
@@ -420,6 +434,7 @@ raise SystemExit(asyncio.run(run_capture()))
             t.start()
 
     def stop_room(self, process_key: str):
+        """Synchronously stop a room, awaiting any active background teardown."""
         stop_thread = None
         with self.lock:
             stop_thread = self.stopping_threads.get(process_key)
@@ -429,6 +444,7 @@ raise SystemExit(asyncio.run(run_capture()))
             stop_thread.join()
 
     def wait_for_all_stops(self, timeout: float = 10.0):
+        """Wait for all outstanding background teardown threads to complete."""
         with self.lock:
             threads = list(self.stopping_threads.values())
         for t in threads:
@@ -504,7 +520,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server_address = ("0.0.0.0", 8080)  # nosec B104
-    httpd = HTTPServer(server_address, RequestHandler)
+    httpd = ThreadingHTTPServer(server_address, RequestHandler)
     logger.info("Starting floor-bot on port 8080...")
     try:
         httpd.serve_forever()
