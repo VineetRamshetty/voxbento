@@ -66,10 +66,15 @@ class SubprocessManager:
                     self._stop_room_async_locked(process_key)
                     to_join = self.stopping_threads.get(process_key)
                 else:
-                    break
+                    self._spawn_room_locked(process_key, event_slug, room_id, jitsi_url, mediamtx_rtsp_base)
+                    return
             if to_join and to_join.is_alive():
                 to_join.join()
 
+    def _spawn_room_locked(
+        self, process_key: str, event_slug: str, room_id: int, jitsi_url: str, mediamtx_rtsp_base: str
+    ):
+        """Spawn the browser/ffmpeg subprocess for a room while caller holds self.lock."""
         with self.lock:
             logger.info(f"Starting subprocess for event: {event_slug}, room: {room_id}")
             env = os.environ.copy()

@@ -230,6 +230,36 @@ class TestSubprocessManager(unittest.TestCase):
             self.assertIn(key, self.mgr.rooms)
             self.assertNotEqual(self.mgr.rooms[key], old_proc)
 
+    def test_concurrent_start_room_serialized_under_lock(self):
+        """Verify concurrent start_room calls for the same room are safely serialized."""
+        key = "event-1"
+        procs_created = []
+
+        def fake_popen(*args, **kwargs):
+            mock_p = MagicMock()
+            mock_p.stdout.readline.return_value = ""
+            mock_p.stderr.readline.return_value = ""
+            mock_p.poll.return_value = None
+            mock_p.wait.return_value = 0
+            procs_created.append(mock_p)
+            return mock_p
+
+        with patch.object(bot.subprocess, "Popen", side_effect=fake_popen):
+            t1 = threading.Thread(
+                target=lambda: self.mgr.start_room("event", 1, "https://meet1.com", "rtsp://mtx:8554")
+            )
+            t2 = threading.Thread(
+                target=lambda: self.mgr.start_room("event", 1, "https://meet2.com", "rtsp://mtx:8554")
+            )
+            t1.start()
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+
+            self.assertIn(key, self.mgr.rooms)
+            self.mgr.wait_for_all_stops(timeout=2.0)
+            self.assertEqual(len(self.mgr.rooms), 1)
+
 
 class TestRequestHandlerStopEndpoint(unittest.TestCase):
     """Integration tests for the RequestHandler /stop endpoint."""
