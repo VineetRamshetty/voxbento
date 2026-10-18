@@ -214,3 +214,27 @@ class TestLifespanRateLimitCleanup:
             assert loop_started.is_set()
 
         assert loop_cancelled.is_set()
+
+    async def test_lifespan_completes_shutdown_when_webhook_task_fails(self, monkeypatch):
+        """Assert that webhook failure does not prevent cleanup-task shutdown."""
+        cleanup_started = asyncio.Event()
+        cleanup_cancelled = asyncio.Event()
+
+        async def _failing_webhook_loop():
+            raise RuntimeError("webhook worker failed")
+
+        async def _stub_cleanup_loop():
+            cleanup_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_cancelled.set()
+                raise
+
+        monkeypatch.setattr("portal.webhooks.worker.webhook_worker_loop", _failing_webhook_loop)
+        monkeypatch.setattr(fastapi_app, "_rate_limit_cleanup_loop", _stub_cleanup_loop)
+
+        async with lifespan(app):
+            await cleanup_started.wait()
+
+        assert cleanup_cancelled.is_set()
