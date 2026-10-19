@@ -44,9 +44,13 @@ def _reset_global_rate_limiters():
 
 @pytest.fixture(autouse=True)
 def _set_test_secrets(monkeypatch):
-    """Ensure a strong SECRET_KEY is set so lifespan secret validation succeeds."""
+    """Ensure test secrets and settings are configured so lifespan secret validation succeeds."""
     monkeypatch.setattr(settings, "jwt_secret", "test-secret-key-that-is-long-enough-for-testing-purposes-1234567890")
     monkeypatch.setattr(settings, "secret_key", "test-secret-key-that-is-long-enough-for-testing-purposes-1234567890")
+    monkeypatch.setattr(settings, "mediamtx_auth_hook_secret", "test-mediamtx-auth-hook-secret-for-testing-1234567890")
+    monkeypatch.setattr(settings, "booth_access_token", "test-booth-access-token-for-testing-purposes-1234567890")
+    monkeypatch.setenv("BOOTH_ACCESS_TOKEN", "test-booth-access-token-for-testing-purposes-1234567890")
+    monkeypatch.setattr("portal.config.Settings.validate_production_secrets", lambda self: None)
 
 
 class TestInMemoryRateLimiterBasic:
@@ -165,6 +169,7 @@ class TestRateLimitCleanupLoop:
 
         task = asyncio.create_task(_rate_limit_cleanup_loop(interval_seconds=0.01))
         try:
+
             async def _wait_for_purge():
                 while "ip_expired" in auth_rate_limiter._store or "token_expired" in token_rate_limiter._store:
                     await asyncio.sleep(0.005)
