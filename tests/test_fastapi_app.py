@@ -1922,6 +1922,7 @@ def test_exactly_32_char_secret_passes_production():
         secret_key="0123456789abcdef0123456789abcdef",
         jwt_secret="",
         mediamtx_auth_hook_secret="media-hook-secret",
+        booth_access_token="0123456789abcdef0123456789abcdef",
     )
     s.validate_production_secrets()  # must not raise
 
