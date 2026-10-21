@@ -19,6 +19,7 @@ from portal import meeting_source, program_ingest
 from portal.auth import require_admin
 from portal.config import settings
 from portal.exceptions import RedirectRequired
+from portal.globals import asset_version_context
 from portal.rate_limit import auth_rate_limiter, token_rate_limiter
 from portal.routers.admin import router as admin_router
 from portal.routers.api import router as api_router
@@ -40,7 +41,9 @@ from portal.workspace_routing import WorkspaceRoutingMiddleware
 
 _BASE_DIR = Path(__file__).resolve().parent
 
-templates = Jinja2Templates(directory=str(_BASE_DIR / "portal" / "templates"))
+templates = Jinja2Templates(
+    directory=str(_BASE_DIR / "portal" / "templates"), context_processors=[asset_version_context]
+)
 
 
 async def _rate_limit_cleanup_loop(interval_seconds: float = 300.0) -> None:
@@ -234,7 +237,10 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
                 request, "500.html", {"request": request, "detail": detail_msg}, status_code=exc.status_code
             )
         return templates.TemplateResponse(
-            request, "400.html", {"request": request, "detail": detail_msg, "status_code": exc.status_code}, status_code=exc.status_code
+            request,
+            "400.html",
+            {"request": request, "detail": detail_msg, "status_code": exc.status_code},
+            status_code=exc.status_code,
         )
     return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=headers)
 
