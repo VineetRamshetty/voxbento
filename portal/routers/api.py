@@ -8,7 +8,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
-from portal.auth import create_embed_token, create_listener_token, decode_token, get_booth_session, security
+from portal.auth import (
+    coordinates_room,
+    create_embed_token,
+    create_listener_token,
+    decode_token,
+    get_booth_session,
+    load_membership_scope,
+    security,
+)
 from portal.booth_identity import make_booth_id, make_mediamtx_path, validate_event_slug, validate_language_code
 from portal.config import settings
 from portal.database import (
@@ -22,8 +30,9 @@ from portal.database import (
     verify_api_key,
 )
 from portal.globals import booths
-from portal.models import DBBooth, Event, EventMembership, Room, RoomMembership
+from portal.models import DBBooth, Event, Room
 from portal.rate_limit import check_rate_limit
+from portal.roles import INTERPRETER
 from portal.schemas.booth import CreateBoothRequest
 from portal.transcription import ProviderConfig, ProviderEnum, get_api_key
 from portal.transcription.worker import start_transcription_worker, stop_transcription_worker
@@ -82,24 +91,13 @@ async def _verify_event_access(
             return
 
         if event_id is not None:
-            is_event_owner = await session.scalar(
-                select(EventMembership.id).where(
-                    EventMembership.user_id == user.id,
-                    EventMembership.event_id == event_id,
-                    EventMembership.role == "event_owner",
-                )
-            )
-            if is_event_owner:
+            scope = await load_membership_scope(session, user.id)
+            if event_id in scope["owned_event_ids"]:
                 return
-            if room_id is not None:
-                is_room_coordinator = await session.scalar(
-                    select(RoomMembership.id).where(
-                        RoomMembership.user_id == user.id,
-                        RoomMembership.room_id == room_id,
-                        RoomMembership.role == "room_coordinator",
-                    )
-                )
-                if is_room_coordinator and not require_booth_management:
+            # Room coordinators may be given per event, room or booth (#757).
+            if room_id is not None and not require_booth_management:
+                room = await session.get(Room, room_id)
+                if room is not None and room.event_id == event_id and coordinates_room(scope, room_id, event_id):
                     return
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Event access required.")
 
@@ -432,7 +430,7 @@ async def create_event_booth(
         invite = await create_invite_token(
             session,
             booth_id=db_booth.id,
-            role="interpreter",
+            role=INTERPRETER,
             label="API Provisioned",
         )
         await session.flush()
