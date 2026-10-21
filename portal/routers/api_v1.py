@@ -106,9 +106,9 @@ class EventResponse(BaseModel):
     owner_id: int | None = Field(
         default=None,
         description=(
-            "User ID of the event owner resolved from EventMembership "
-            "(role='event_owner'). None if no owner membership exists. "
-            "If multiple event_owner rows exist, the lowest user_id is returned."
+            "User ID of the event owner resolved from EventMembership. "
+            "None if no owner membership exists. "
+            "If multiple owner rows exist, the lowest user_id is returned."
         ),
     )
     created_at: str = Field(description="ISO-8601 UTC creation timestamp.")
@@ -152,7 +152,7 @@ async def get_event(
         select(EventMembership.user_id)
         .where(
             EventMembership.event_id == event.id,
-            EventMembership.role == "event_owner",
+            EventMembership.role == EVENT_OWNER,
         )
         .order_by(EventMembership.user_id)
         .limit(1)
