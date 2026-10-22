@@ -464,3 +464,22 @@ class TestGetEventConfidentialClient:
         resp = await _get_event(event.slug, raw_token)
 
         assert resp.status_code == 404
+
+    @pytest.mark.anyio
+    async def test_deactivated_user_with_confidential_client_is_rejected(self, setup_db):
+        """A confidential client token belonging to a deactivated user must be rejected.
+
+        Account state is security-critical and checked ahead of the confidential
+        client bypass in _verify_token_rbac.
+        """
+        event = await _make_event("m2m-deactivated", "M2M Deactivated User Event")
+        user = await _make_user("m2m-deact@example.com")
+        raw_token = await _make_oauth_token(user.id, event.id, ["events:read"], is_confidential=True)
+
+        await _deactivate_user(user.id)
+
+        resp = await _get_event(event.slug, raw_token)
+
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "User account is inactive"
+

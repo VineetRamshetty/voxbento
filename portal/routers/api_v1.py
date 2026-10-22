@@ -68,11 +68,6 @@ async def _verify_token_rbac(
         if not room or room.event_id != event.id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Room not found")
 
-    # Confidential clients manage their own RBAC
-    client = await db.get(OAuthClient, token.client_id)
-    if client and client.is_confidential and client.status == "active":
-        return
-
     from portal.models import User
 
     user = await db.get(User, token.user_id)
@@ -83,6 +78,11 @@ async def _verify_token_rbac(
     # account unless we re-check here, ahead of every bypass below.
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive")
+
+    # Confidential clients manage their own RBAC
+    client = await db.get(OAuthClient, token.client_id)
+    if client and client.is_confidential and client.status == "active":
+        return
 
     # Check if user is Admin
     if getattr(user, "is_admin", False):
