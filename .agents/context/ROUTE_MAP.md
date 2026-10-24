@@ -95,6 +95,10 @@ with `?error=invalid_role&role=…` and the page explains why.
 | POST | `/admin/events/{event_id}/delete` | — | Cascade-deletes event |
 | GET | `/admin/events/{event_id}/rooms/` | `admin/room_list.html` | Supports optional `search` query parameter to filter rooms server-side against `Room.display_name` (case-insensitive `ilike` match with SQL wildcard escaping for `%`, `_`, and `\\`). |
 | POST | `/admin/events/{event_id}/rooms/` | — | Creates room; auto-generates Jitsi URL |
+| GET/POST | `/admin/events/{event_id}/rooms/new` | `admin/room_setup.html` | Guided room creation: spoken/listener languages, interpreter/AI delivery, captions and voice; owner-only, POST requires same origin; `?from=setup` returns to the Rooms & languages wizard step |
+| GET/POST | `/admin/events/{event_id}/rooms/{room_id}/setup` | `admin/room_setup.html` | Owner-only edit of the same room plan; POST requires same origin and checks room/event scope; preserves live booths and explicitly retained same-language booths |
+| GET/POST | `/admin/events/{event_id}/setup/rooms` | `admin/wizard_rooms.html` | Rooms & languages step; GET links to guided room creation, legacy POST still creates a room |
+| GET/POST | `/admin/events/{event_id}/setup/booths` | — | Legacy GET redirects to Rooms & languages; legacy POST still creates a booth in this event and redirects there |
 | GET | `/admin/events/{event_id}/rooms/{room_id}/` | `admin/room_detail.html` | Room + booths |
 | POST | `/admin/events/{event_id}/rooms/{room_id}/edit` | — | Updates jitsi_url + relay_booth_id |
 | POST | `/admin/events/{event_id}/rooms/{room_id}/ai-vocabulary/upload` | — | Upload CSV glossary entries for room AI interpretation |
@@ -141,6 +145,7 @@ with `?error=invalid_role&role=…` and the page explains why.
 | `portal/routers/listener.py` | WHEP listener UI route |
 | `portal/routers/api.py` | Booth state REST API, WHIP URL generation |
 | `portal/routers/admin.py` | Shared event-management handlers and system-admin routes |
+| `portal/room_setup.py` | Room plan parsing, available AI services, booth/translation-language reconciliation, and room summaries; uses existing tables |
 | `portal/workspace_routing.py` | `/workspace` handler mapping, legacy organizer redirects, and template URL context |
 | `portal/websockets/manager.py` | `ws_booth` and `ws_captions` endpoints |
 | `portal/websockets/handlers.py` | Specific `_handle_*` logic for WS messages |
