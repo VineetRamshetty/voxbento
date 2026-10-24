@@ -66,6 +66,7 @@ VoxBento is a production-grade **browser-first interpretation booth console** fo
 |---|---|
 | `fastapi_app.py` | Application lifespan, router aggregation, global exception handlers |
 | `portal/routers/` | All HTTP routes (pages, admin, REST API), Jinja2 template rendering |
+| `portal/room_setup.py` | Room plan parsing, available AI services, booth/translation-language reconciliation, and room summaries |
 | `portal/workspace_routing.py` | `/workspace` handler mapping, legacy organizer redirects, management URL/template namespace helpers |
 | `portal/websockets/` | WebSocket connection manager, message handlers (`_handle_join`, etc.) |
 | `portal/booth_state.py` | In-memory `BoothRegistry`, `Booth`, `Participant`, handoff policy, chat history |
