@@ -37,6 +37,10 @@ def _wait_for_proc(proc: subprocess.Popen, label: str) -> None:
             logger.error(f"Unexpected error stopping subprocess for {label}: {exc}")
             try:
                 proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    logger.error(f"Subprocess for {label} did not exit after SIGKILL")
             except Exception as kill_exc:
                 logger.debug(f"Kill failed for {label}: {kill_exc}")
 

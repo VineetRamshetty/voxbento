@@ -64,13 +64,26 @@ class TestWaitForProc(unittest.TestCase):
         proc.kill.assert_called_once()
 
     def test_wait_for_proc_unexpected_exception_handled(self):
-        """Verify unexpected errors during termination are caught and kill is attempted."""
+        """Verify unexpected errors during termination are caught, kill is attempted, and wait reaps the process."""
         proc = MagicMock(spec=subprocess.Popen)
         proc.poll.return_value = None
         proc.terminate.side_effect = RuntimeError("Process lookup error")
+        proc.wait.return_value = 0
 
         bot._wait_for_proc(proc, "test-room")
         proc.kill.assert_called_once()
+        proc.wait.assert_called_once_with(timeout=3)
+
+    def test_wait_for_proc_unexpected_exception_kill_timeout_tolerated(self):
+        """Verify kill timeout in exception handler does not raise."""
+        proc = MagicMock(spec=subprocess.Popen)
+        proc.poll.return_value = None
+        proc.terminate.side_effect = RuntimeError("Process lookup error")
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="test", timeout=3)
+
+        bot._wait_for_proc(proc, "test-room")
+        proc.kill.assert_called_once()
+        proc.wait.assert_called_once_with(timeout=3)
 
 
 class TestSubprocessManager(unittest.TestCase):
