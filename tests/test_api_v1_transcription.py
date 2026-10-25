@@ -28,6 +28,7 @@ def _result(first=None, all_=()):
     result = MagicMock()
     result.scalars.return_value.first.return_value = first
     result.scalars.return_value.all.return_value = list(all_)
+    result.all.return_value = list(all_)
     return result
 
 
@@ -189,6 +190,7 @@ async def test_status_reports_only_the_requested_rooms_booths(real_db, running_w
 
 @pytest.mark.anyio
 async def test_export_returns_segments_as_json(event):
+    """Test exporting transcript segments as JSON with expected schema."""
     now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
     segments = [
         SimpleNamespace(id=1, text="First utterance", language_code="en", created_at=now),
@@ -209,6 +211,7 @@ async def test_export_returns_segments_as_json(event):
 
 @pytest.mark.anyio
 async def test_export_returns_empty_list_when_no_segments(event):
+    """Test exporting when no segments exist returns an empty list."""
     db = _db(_result(first=event), _result(all_=[]))
 
     response = await api_v1.export_transcript(EVENT_SLUG, ROOM_ID, "en", db=db, token=object())
@@ -218,6 +221,7 @@ async def test_export_returns_empty_list_when_no_segments(event):
 
 @pytest.mark.anyio
 async def test_export_unknown_event_is_404():
+    """Test export request for a non-existent event returns 404."""
     with pytest.raises(api_v1.HTTPException) as exc_info:
         await api_v1.export_transcript(EVENT_SLUG, ROOM_ID, "en", db=_db(_result(first=None)), token=object())
 
@@ -226,6 +230,7 @@ async def test_export_unknown_event_is_404():
 
 @pytest.mark.anyio
 async def test_export_vtt_format(event):
+    """Test exporting transcript as WebVTT with playback elapsed timestamps."""
     now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
     segments = [
         SimpleNamespace(id=1, text="Hello world", language_code="en", created_at=now),
@@ -237,12 +242,24 @@ async def test_export_vtt_format(event):
     assert response.media_type == "text/vtt"
     body = response.body.decode("utf-8")
     assert body.startswith("WEBVTT\n")
-    assert "12:00:00.000 --> 12:00:05.000" in body
+    assert "00:00:00.000 --> 00:00:05.000" in body
     assert "Hello world" in body
 
 
 @pytest.mark.anyio
+async def test_export_vtt_empty_format(event):
+    """Test exporting empty transcript as WebVTT terminates header with two newlines."""
+    db = _db(_result(first=event), _result(all_=[]))
+
+    response = await api_v1.export_transcript(EVENT_SLUG, ROOM_ID, "en", format="vtt", db=db, token=object())
+
+    assert response.media_type == "text/vtt"
+    assert response.body.decode("utf-8") == "WEBVTT\n\n"
+
+
+@pytest.mark.anyio
 async def test_export_srt_format(event):
+    """Test exporting transcript as SubRip (SRT) format with playback timestamps."""
     now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
     segments = [
         SimpleNamespace(id=1, text="Hello world", language_code="en", created_at=now),
@@ -253,11 +270,30 @@ async def test_export_srt_format(event):
 
     assert response.media_type == "text/plain"
     body = response.body.decode("utf-8")
-    assert "1\n12:00:00,000 --> 12:00:05,000\nHello world" in body
+    assert "1\n00:00:00,000 --> 00:00:05,000\nHello world" in body
+
+
+@pytest.mark.anyio
+async def test_export_subtitle_cues_do_not_overlap(event):
+    """Test that consecutive cues shorter than 5s do not overlap in subtitles."""
+    t0 = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=2)
+    segments = [
+        SimpleNamespace(id=1, text="Short utterance", language_code="en", created_at=t0),
+        SimpleNamespace(id=2, text="Next utterance", language_code="en", created_at=t1),
+    ]
+    db = _db(_result(first=event), _result(all_=segments))
+
+    response = await api_v1.export_transcript(EVENT_SLUG, ROOM_ID, "en", format="vtt", db=db, token=object())
+    body = response.body.decode("utf-8")
+    # Cue 1 should end at 00:00:02.000 when cue 2 starts, not 00:00:05.000
+    assert "00:00:00.000 --> 00:00:02.000" in body
+    assert "00:00:02.000 --> 00:00:07.000" in body
 
 
 @pytest.mark.anyio
 async def test_export_accept_header_content_negotiation(event):
+    """Test content negotiation via Accept header."""
     now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
     segments = [
         SimpleNamespace(id=1, text="Header test", language_code="en", created_at=now),
@@ -274,6 +310,7 @@ async def test_export_accept_header_content_negotiation(event):
 
 @pytest.mark.anyio
 async def test_export_target_lang_translations(event):
+    """Test exporting translations preserves segment source timestamps."""
     now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
     translations = [
         SimpleNamespace(id=1, text="Hola mundo", language_code="es", created_at=now),
@@ -290,6 +327,7 @@ async def test_export_target_lang_translations(event):
 
 @pytest.mark.anyio
 async def test_export_real_db_queries_and_filters(real_db):
+    """Test real SQLite database integration with filters, translations, and non-UTC offsets."""
     event = await create_event(real_db, slug=EVENT_SLUG, display_name="PyCon 2026")
     room_a = await create_room(real_db, event_id=event.id, display_name="Hall A")
     room_b = await create_room(real_db, event_id=event.id, display_name="Hall B")
@@ -305,8 +343,10 @@ async def test_export_real_db_queries_and_filters(real_db):
     real_db.add_all([seg_a1, seg_a2, seg_a_fr, seg_b])
     await real_db.flush()
 
+    # Translation stored later than speech
+    t_stored = datetime(2026, 10, 24, 10, 1, 0, tzinfo=timezone.utc)
     trans_a1_es = TranscriptTranslation(
-        segment_id=seg_a1.id, language_code="es", text="Bienvenido a la sala A", created_at=t1
+        segment_id=seg_a1.id, language_code="es", text="Bienvenido a la sala A", created_at=t_stored
     )
     real_db.add(trans_a1_es)
     await real_db.flush()
@@ -315,25 +355,36 @@ async def test_export_real_db_queries_and_filters(real_db):
     result = await api_v1.export_transcript(EVENT_SLUG, room_a.id, "en", db=real_db, token=object())
     assert [r["text"] for r in result] == ["Welcome to room A", "Room A ongoing"]
 
-    # 2. Filter after T1
-    result_after = await api_v1.export_transcript(EVENT_SLUG, room_a.id, "en", after=t1, db=real_db, token=object())
+    # 2. Filter after T1 with non-UTC offset (+05:30)
+    t1_offset = datetime(2026, 10, 24, 15, 30, 0, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    result_after = await api_v1.export_transcript(
+        EVENT_SLUG, room_a.id, "en", after=t1_offset, db=real_db, token=object()
+    )
     assert [r["text"] for r in result_after] == ["Room A ongoing"]
 
     # 3. Filter before T2
     result_before = await api_v1.export_transcript(EVENT_SLUG, room_a.id, "en", before=t2, db=real_db, token=object())
     assert [r["text"] for r in result_before] == ["Welcome to room A"]
 
-    # 4. Translations target_lang
+    # 4. Translations target_lang uses source segment timestamp (t1, not t_stored)
     result_trans = await api_v1.export_transcript(
         EVENT_SLUG, room_a.id, "en", target_lang="es", db=real_db, token=object()
     )
     assert len(result_trans) == 1
     assert result_trans[0]["text"] == "Bienvenido a la sala A"
     assert result_trans[0]["language_code"] == "es"
+    assert result_trans[0]["created_at"] == t1.isoformat()
 
-    # 5. VTT format output
+    # 5. VTT format output with playback offset
     vtt_res = await api_v1.export_transcript(EVENT_SLUG, room_a.id, "en", format="vtt", db=real_db, token=object())
     vtt_text = vtt_res.body.decode("utf-8")
     assert vtt_text.startswith("WEBVTT\n")
+    assert "00:00:00.000 --> 00:00:05.000" in vtt_text
     assert "Welcome to room A" in vtt_text
+    assert "00:05:00.000 --> 00:05:05.000" in vtt_text
     assert "Room A ongoing" in vtt_text
+
+    # 6. Limit parameter caps returned segments
+    result_limited = await api_v1.export_transcript(EVENT_SLUG, room_a.id, "en", limit=1, db=real_db, token=object())
+    assert len(result_limited) == 1
+    assert result_limited[0]["text"] == "Welcome to room A"

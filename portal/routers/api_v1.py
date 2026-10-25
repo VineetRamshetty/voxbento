@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -911,46 +911,124 @@ async def get_transcription_status(
 
 
 
-def _format_timestamp(dt: datetime, sep: str = ".") -> str:
-    ms = dt.microsecond // 1000
-    return f"{dt.strftime('%H:%M:%S')}{sep}{ms:03d}"
+class TranscriptExportItem(BaseModel):
+    """Schema for an exported transcript segment or translation."""
+
+    id: int = Field(description="Segment or translation unique identifier")
+    text: str = Field(description="Transcribed or translated text content")
+    language_code: str = Field(description="Language code of this text")
+    created_at: str = Field(description="ISO-8601 UTC timestamp when speech occurred")
 
 
-def _to_vtt(items: list[TranscriptSegment | TranscriptTranslation]) -> str:
+def _to_utc(dt: datetime | None) -> datetime | None:
+    """Normalize a datetime to timezone-aware UTC.
+
+    If naive, assume UTC. If aware with a non-UTC offset, convert to UTC.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_playback_time(seconds: float, sep: str = ".") -> str:
+    """Format elapsed seconds as HH:MM:SS.mmm (or HH:MM:SS,mmm)."""
+    total_ms = int(round(seconds * 1000))
+    hours = total_ms // 3_600_000
+    minutes = (total_ms % 3_600_000) // 60_000
+    secs = (total_ms % 60_000) // 1000
+    ms = total_ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{ms:03d}"
+
+
+def _normalize_item_dt(dt: datetime) -> datetime:
+    """Ensure an item datetime is UTC-aware for delta calculation."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _to_vtt(items: list[Any], origin: datetime | None = None) -> str:
+    """Serialize transcript items to WebVTT format using playback elapsed offsets."""
+    if not items:
+        return "WEBVTT\n\n"
+    if origin is None:
+        origin = items[0].created_at
+    origin_utc = _normalize_item_dt(origin)
     lines = ["WEBVTT", ""]
     for i, item in enumerate(items, 1):
-        start = _format_timestamp(item.created_at, sep=".")
-        end_dt = item.created_at + timedelta(seconds=5)
-        end = _format_timestamp(end_dt, sep=".")
+        item_dt = _normalize_item_dt(item.created_at)
+        start_sec = max(0.0, (item_dt - origin_utc).total_seconds())
+        if i < len(items):
+            next_dt = _normalize_item_dt(items[i].created_at)
+            next_start_sec = max(start_sec, (next_dt - origin_utc).total_seconds())
+            end_sec = min(start_sec + 5.0, next_start_sec) if next_start_sec > start_sec else start_sec + 5.0
+        else:
+            end_sec = start_sec + 5.0
+        start = _format_playback_time(start_sec, sep=".")
+        end = _format_playback_time(end_sec, sep=".")
         lines.extend([str(i), f"{start} --> {end}", item.text, ""])
     return "\n".join(lines)
 
 
-def _to_srt(items: list[TranscriptSegment | TranscriptTranslation]) -> str:
+def _to_srt(items: list[Any], origin: datetime | None = None) -> str:
+    """Serialize transcript items to SubRip (SRT) format using playback elapsed offsets."""
+    if not items:
+        return ""
+    if origin is None:
+        origin = items[0].created_at
+    origin_utc = _normalize_item_dt(origin)
     lines: list[str] = []
     for i, item in enumerate(items, 1):
-        start = _format_timestamp(item.created_at, sep=",")
-        end_dt = item.created_at + timedelta(seconds=5)
-        end = _format_timestamp(end_dt, sep=",")
+        item_dt = _normalize_item_dt(item.created_at)
+        start_sec = max(0.0, (item_dt - origin_utc).total_seconds())
+        if i < len(items):
+            next_dt = _normalize_item_dt(items[i].created_at)
+            next_start_sec = max(start_sec, (next_dt - origin_utc).total_seconds())
+            end_sec = min(start_sec + 5.0, next_start_sec) if next_start_sec > start_sec else start_sec + 5.0
+        else:
+            end_sec = start_sec + 5.0
+        start = _format_playback_time(start_sec, sep=",")
+        end = _format_playback_time(end_sec, sep=",")
         lines.extend([str(i), f"{start} --> {end}", item.text, ""])
     return "\n".join(lines)
 
 
-@router.get("/events/{event_slug}/rooms/{room_id}/booths/{language_code}/transcripts/export")
+@router.get(
+    "/events/{event_slug}/rooms/{room_id}/booths/{language_code}/transcripts/export",
+    response_model=list[TranscriptExportItem],
+    responses={
+        200: {
+            "description": "Exported transcript records in JSON, WebVTT, or SubRip format.",
+            "content": {
+                "application/json": {},
+                "text/vtt": {"schema": {"type": "string"}},
+                "text/plain": {"schema": {"type": "string"}},
+            },
+        }
+    },
+    summary="Export transcripts",
+)
 async def export_transcript(
     event_slug: str,
     room_id: int | str,
     language_code: str,
-    target_lang: str | None = Query(None),
-    format: str | None = Query(None, pattern="^(json|vtt|srt)$"),
-    after: datetime | None = Query(None),
-    before: datetime | None = Query(None),
-    start_time: datetime | None = Query(None),
-    end_time: datetime | None = Query(None),
-    accept: str | None = Header(None),
+    target_lang: str | None = Query(None, description="Target language code to export translated transcripts"),
+    format: str | None = Query(None, pattern="^(json|vtt|srt)$", description="Export format: json (default), vtt, or srt"),
+    after: datetime | None = Query(None, description="Filter segments created after this UTC datetime"),
+    before: datetime | None = Query(None, description="Filter segments created before this UTC datetime"),
+    start_time: datetime | None = Query(None, description="Alias for after"),
+    end_time: datetime | None = Query(None, description="Alias for before"),
+    limit: int = Query(1000, ge=1, le=5000, description="Maximum number of segments to export"),
+    accept: str | None = Header(None, description="Content negotiation header (e.g. text/vtt, text/srt)"),
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("transcripts:read")),
 ):
+    """Export transcripts or translations for a room and language booth.
+
+    Supports JSON (default), WebVTT (text/vtt), and SubRip (text/plain).
+    Results can be filtered by time range (after/start_time, before/end_time)
+    and bounded by limit.
+    """
     result = await db.execute(select(Event).where(Event.slug == event_slug))
     event = result.scalars().first()
     if not event:
@@ -959,17 +1037,23 @@ async def export_transcript(
     room = await _verify_token_rbac(db, token, event, room_id, lock_event=True)
     target_room_id = _extract_room_id(room, room_id)
 
-    after_dt = after if isinstance(after, datetime) else (start_time if isinstance(start_time, datetime) else None)
-    before_dt = before if isinstance(before, datetime) else (end_time if isinstance(end_time, datetime) else None)
-    if after_dt and after_dt.tzinfo is None:
-        after_dt = after_dt.replace(tzinfo=timezone.utc)
-    if before_dt and before_dt.tzinfo is None:
-        before_dt = before_dt.replace(tzinfo=timezone.utc)
+    raw_after = after if isinstance(after, datetime) else (start_time if isinstance(start_time, datetime) else None)
+    raw_before = before if isinstance(before, datetime) else (end_time if isinstance(end_time, datetime) else None)
+    after_dt = _to_utc(raw_after)
+    before_dt = _to_utc(raw_before)
 
     target_lang_str = target_lang if isinstance(target_lang, str) else None
+    limit_val = limit if isinstance(limit, int) else 1000
+    safe_limit = min(max(1, limit_val), 5000)
+
     if target_lang_str:
         stmt = (
-            select(TranscriptTranslation)
+            select(
+                TranscriptTranslation.id,
+                TranscriptTranslation.text,
+                TranscriptTranslation.language_code,
+                TranscriptSegment.created_at.label("created_at"),
+            )
             .join(TranscriptSegment, TranscriptTranslation.segment_id == TranscriptSegment.id)
             .where(
                 TranscriptSegment.room_id == target_room_id,
@@ -977,11 +1061,15 @@ async def export_transcript(
                 TranscriptTranslation.language_code == target_lang_str,
             )
             .order_by(TranscriptSegment.created_at)
+            .limit(safe_limit)
         )
         if after_dt:
             stmt = stmt.where(TranscriptSegment.created_at > after_dt)
         if before_dt:
             stmt = stmt.where(TranscriptSegment.created_at < before_dt)
+
+        result = await db.execute(stmt)
+        items = result.all()
     else:
         stmt = (
             select(TranscriptSegment)
@@ -990,14 +1078,15 @@ async def export_transcript(
                 TranscriptSegment.language_code == language_code,
             )
             .order_by(TranscriptSegment.created_at)
+            .limit(safe_limit)
         )
         if after_dt:
             stmt = stmt.where(TranscriptSegment.created_at > after_dt)
         if before_dt:
             stmt = stmt.where(TranscriptSegment.created_at < before_dt)
 
-    result = await db.execute(stmt)
-    items = result.scalars().all()
+        result = await db.execute(stmt)
+        items = result.scalars().all()
 
     format_str = format if isinstance(format, str) else None
     accept_str = accept if isinstance(accept, str) else None
@@ -1021,7 +1110,7 @@ async def export_transcript(
             "id": item.id,
             "text": item.text,
             "language_code": item.language_code,
-            "created_at": item.created_at.isoformat(),
+            "created_at": _normalize_item_dt(item.created_at).isoformat(),
         }
         for item in items
     ]
