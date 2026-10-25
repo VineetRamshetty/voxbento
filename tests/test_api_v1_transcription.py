@@ -309,6 +309,39 @@ async def test_export_accept_header_content_negotiation(event):
 
 
 @pytest.mark.anyio
+async def test_export_accept_header_srt_media_types(event):
+    """Test content negotiation via Accept header for SRT formats."""
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
+    segments = [
+        SimpleNamespace(id=1, text="SRT test", language_code="en", created_at=now),
+    ]
+    db1 = _db(_result(first=event), _result(all_=segments))
+    res1 = await api_v1.export_transcript(EVENT_SLUG, ROOM_ID, "en", accept="text/srt", db=db1, token=object())
+    assert res1.media_type == "text/srt"
+
+    db2 = _db(_result(first=event), _result(all_=segments))
+    res2 = await api_v1.export_transcript(
+        EVENT_SLUG, ROOM_ID, "en", accept="application/x-subrip", db=db2, token=object()
+    )
+    assert res2.media_type == "application/x-subrip"
+
+
+@pytest.mark.anyio
+async def test_export_item_non_utc_created_at_normalized_to_utc(event):
+    """Test that items with non-UTC created_at offsets are emitted in UTC in JSON."""
+    offset_dt = datetime(2026, 10, 24, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+    segments = [
+        SimpleNamespace(id=1, text="Offset utterance", language_code="en", created_at=offset_dt),
+    ]
+    db = _db(_result(first=event), _result(all_=segments))
+
+    response = await api_v1.export_transcript(EVENT_SLUG, ROOM_ID, "en", db=db, token=object())
+
+    # 14:00 +02:00 is 12:00 UTC
+    assert response[0]["created_at"] == "2026-10-24T12:00:00+00:00"
+
+
+@pytest.mark.anyio
 async def test_export_target_lang_translations(event):
     """Test exporting translations preserves segment source timestamps."""
     now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)

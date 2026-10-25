@@ -942,24 +942,19 @@ def _format_playback_time(seconds: float, sep: str = ".") -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{ms:03d}"
 
 
-def _normalize_item_dt(dt: datetime) -> datetime:
-    """Ensure an item datetime is UTC-aware for delta calculation."""
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-
-
 def _to_vtt(items: list[Any], origin: datetime | None = None) -> str:
     """Serialize transcript items to WebVTT format using playback elapsed offsets."""
     if not items:
         return "WEBVTT\n\n"
     if origin is None:
         origin = items[0].created_at
-    origin_utc = _normalize_item_dt(origin)
+    origin_utc = _to_utc(origin)
     lines = ["WEBVTT", ""]
     for i, item in enumerate(items, 1):
-        item_dt = _normalize_item_dt(item.created_at)
+        item_dt = _to_utc(item.created_at)
         start_sec = max(0.0, (item_dt - origin_utc).total_seconds())
         if i < len(items):
-            next_dt = _normalize_item_dt(items[i].created_at)
+            next_dt = _to_utc(items[i].created_at)
             next_start_sec = max(start_sec, (next_dt - origin_utc).total_seconds())
             end_sec = min(start_sec + 5.0, next_start_sec) if next_start_sec > start_sec else start_sec + 5.0
         else:
@@ -976,13 +971,13 @@ def _to_srt(items: list[Any], origin: datetime | None = None) -> str:
         return ""
     if origin is None:
         origin = items[0].created_at
-    origin_utc = _normalize_item_dt(origin)
+    origin_utc = _to_utc(origin)
     lines: list[str] = []
     for i, item in enumerate(items, 1):
-        item_dt = _normalize_item_dt(item.created_at)
+        item_dt = _to_utc(item.created_at)
         start_sec = max(0.0, (item_dt - origin_utc).total_seconds())
         if i < len(items):
-            next_dt = _normalize_item_dt(items[i].created_at)
+            next_dt = _to_utc(items[i].created_at)
             next_start_sec = max(start_sec, (next_dt - origin_utc).total_seconds())
             end_sec = min(start_sec + 5.0, next_start_sec) if next_start_sec > start_sec else start_sec + 5.0
         else:
@@ -1003,6 +998,8 @@ def _to_srt(items: list[Any], origin: datetime | None = None) -> str:
                 "application/json": {},
                 "text/vtt": {"schema": {"type": "string"}},
                 "text/plain": {"schema": {"type": "string"}},
+                "text/srt": {"schema": {"type": "string"}},
+                "application/x-subrip": {"schema": {"type": "string"}},
             },
         }
     },
@@ -1019,13 +1016,13 @@ async def export_transcript(
     start_time: datetime | None = Query(None, description="Alias for after"),
     end_time: datetime | None = Query(None, description="Alias for before"),
     limit: int = Query(1000, ge=1, le=5000, description="Maximum number of segments to export"),
-    accept: str | None = Header(None, description="Content negotiation header (e.g. text/vtt, text/srt)"),
+    accept: str | None = Header(None, description="Content negotiation header (e.g. text/vtt, text/srt, application/x-subrip)"),
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("transcripts:read")),
 ):
     """Export transcripts or translations for a room and language booth.
 
-    Supports JSON (default), WebVTT (text/vtt), and SubRip (text/plain).
+    Supports JSON (default), WebVTT (text/vtt), and SubRip (text/plain, text/srt, application/x-subrip).
     Results can be filtered by time range (after/start_time, before/end_time)
     and bounded by limit.
     """
@@ -1091,6 +1088,13 @@ async def export_transcript(
     format_str = format if isinstance(format, str) else None
     accept_str = accept if isinstance(accept, str) else None
 
+    srt_media_type = "text/plain"
+    if accept_str:
+        if "application/x-subrip" in accept_str:
+            srt_media_type = "application/x-subrip"
+        elif "text/srt" in accept_str:
+            srt_media_type = "text/srt"
+
     if format_str:
         resolved_format = format_str.lower()
     elif accept_str and "text/vtt" in accept_str:
@@ -1103,14 +1107,14 @@ async def export_transcript(
     if resolved_format == "vtt":
         return PlainTextResponse(_to_vtt(items), media_type="text/vtt")
     if resolved_format == "srt":
-        return PlainTextResponse(_to_srt(items), media_type="text/plain")
+        return PlainTextResponse(_to_srt(items), media_type=srt_media_type)
 
     return [
         {
             "id": item.id,
             "text": item.text,
             "language_code": item.language_code,
-            "created_at": _normalize_item_dt(item.created_at).isoformat(),
+            "created_at": _to_utc(item.created_at).isoformat(),
         }
         for item in items
     ]
