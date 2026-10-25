@@ -303,6 +303,76 @@ async def test_oauth_models_is_expired_property():
     assert token_expired_naive.is_expired is True
     assert token_active_naive.is_expired is False
 
+    # 5. Non-UTC aware datetimes:
+    # If buggy code ran .replace(tzinfo=timezone.utc), it would overwrite the offset and flip classification.
+    # Past instant with +05:00 offset (clock time is in future relative to UTC):
+    tz_east = timezone(timedelta(hours=5))
+    past_non_utc = (datetime.now(timezone.utc) - timedelta(minutes=10)).astimezone(tz_east)
+    code_non_utc_expired = OAuthAuthorizationCode(expires_at=past_non_utc)
+    token_non_utc_expired = OAuthToken(expires_at=past_non_utc)
+    assert code_non_utc_expired.is_expired is True
+    assert token_non_utc_expired.is_expired is True
+
+    # Future instant with -05:00 offset (clock time is in past relative to UTC):
+    tz_west = timezone(timedelta(hours=-5))
+    future_non_utc = (datetime.now(timezone.utc) + timedelta(minutes=10)).astimezone(tz_west)
+    code_non_utc_active = OAuthAuthorizationCode(expires_at=future_non_utc)
+    token_non_utc_active = OAuthToken(expires_at=future_non_utc)
+    assert code_non_utc_active.is_expired is False
+    assert token_non_utc_active.is_expired is False
+
+
+@pytest.mark.anyio
+async def test_require_oauth_scope_expired_token():
+    """require_oauth_scope rejects expired tokens at boundary using oauth_token.is_expired."""
+    from unittest.mock import MagicMock
+
+    from fastapi import HTTPException
+    from fastapi.security import HTTPAuthorizationCredentials
+
+    from portal.auth import require_oauth_scope
+    from portal.database import create_event, create_user, get_session
+    from portal.models import DeveloperAccount, OAuthClient, OAuthToken
+
+    async with get_session() as s:
+        user = await create_user(s, email="auth_exp@example.com", display_name="AuthExp")
+        event = await create_event(s, slug="authexp-event", display_name="AuthExp Event")
+        dev = DeveloperAccount(user_id=user.id, status="approved")
+        s.add(dev)
+        await s.flush()
+        client = OAuthClient(
+            developer_account_id=dev.id,
+            client_id="authexp-client",
+            name="AuthExp Client",
+            status="active",
+            is_confidential=False,
+            scopes_requested=["events:read"],
+        )
+        s.add(client)
+        await s.flush()
+
+        raw_tok = secrets.token_urlsafe(32)
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        tok = OAuthToken(
+            client_id=client.id,
+            user_id=user.id,
+            event_id=event.id,
+            scopes=["events:read"],
+            access_token_hash=_hash(raw_tok),
+            expires_at=past,
+        )
+        s.add(tok)
+        await s.commit()
+
+    async with get_session() as s:
+        req = MagicMock()
+        dep = require_oauth_scope("events:read")
+        cred = HTTPAuthorizationCredentials(scheme="Bearer", credentials=raw_tok)
+        with pytest.raises(HTTPException) as exc_info:
+            await dep(request=req, db=s, token=cred)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Token expired"
+
 
 # ---------------------------------------------------------------------------
 # D. Successful authorization-code exchange
