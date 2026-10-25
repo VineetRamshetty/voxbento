@@ -317,6 +317,7 @@ async def _handle_authorization_code_grant(
     redirect_uri: str | None,
     code_verifier: str | None,
 ) -> dict | JSONResponse:
+    """Validate authorization code grant, verify PKCE, and issue access/refresh tokens."""
     if not code or not redirect_uri or not code_verifier:
         return JSONResponse(status_code=400, content={"error": "invalid_request"})
 

@@ -862,11 +862,14 @@ oauth2_bearer = HTTPBearer(auto_error=False)
 
 
 def require_oauth_scope(required_scope: str):
+    """Return a FastAPI dependency verifying the Bearer token has the required OAuth scope."""
+
     async def dependency(
         request: Request,
         db: AsyncSession = Depends(get_db_session),
         token: HTTPAuthorizationCredentials | None = Depends(oauth2_bearer),
     ):
+        """Verify Bearer token validity, client active status, expiration, and scope."""
         if not token:
             raise HTTPException(status_code=401, detail="Missing Bearer Token")
 

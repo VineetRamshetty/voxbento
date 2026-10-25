@@ -23,6 +23,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 async def setup_db():
+    """Set up and tear down in-memory test database."""
     from portal.database import configure, dispose, init_db
 
     configure("sqlite+aiosqlite://")
@@ -40,10 +41,12 @@ def _pkce_pair() -> tuple[str, str]:
 
 
 def _hash(token: str) -> str:
+    """Return SHA-256 hexadecimal hash of token."""
     return hashlib.sha256(token.encode()).hexdigest()
 
 
 def _client():
+    """Return an async test client bound to the FastAPI application."""
     from httpx import ASGITransport, AsyncClient
 
     from fastapi_app import app
