@@ -1877,6 +1877,20 @@ def test_common_password_secret_raises_in_production():
         s.validate_production_secrets()
 
 
+def test_none_secret_raises_in_production():
+    """Verify that a None effective secret raises RuntimeError instead of TypeError."""
+    from portal.config import Settings
+
+    class NoneSecretSettings(Settings):
+        @property
+        def effective_jwt_secret(self) -> str:
+            return None  # type: ignore[return-value]
+
+    s = NoneSecretSettings(debug=False)
+    with pytest.raises(RuntimeError, match="known-weak default value"):
+        s.validate_production_secrets()
+
+
 def test_short_secret_raises_in_production():
     """Verify that production rejects secrets shorter than 32 characters."""
     from portal.config import Settings
