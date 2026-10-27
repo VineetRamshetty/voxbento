@@ -33,6 +33,7 @@ def _result(first=None, all_=()):
 
 
 def _db(*results):
+    """Construct a mock AsyncSession executing predefined results sequentially."""
     db = MagicMock()
     db.execute = AsyncMock(side_effect=list(results))
     return db
@@ -40,13 +41,13 @@ def _db(*results):
 
 @pytest.fixture
 def event():
+    """Fixture providing a mock Event namespace."""
     return SimpleNamespace(id=1, slug=EVENT_SLUG)
 
 
 @pytest.fixture(autouse=True)
 def _skip_rbac():
-    # Authorisation is covered elsewhere; these tests are about what happens
-    # after the caller has been let in.
+    """Bypass token RBAC validation during endpoint unit tests."""
     with patch.object(api_v1, "_verify_token_rbac", AsyncMock()):
         yield
 
@@ -70,6 +71,7 @@ def running_worker():
 
 @pytest.mark.anyio
 async def test_stop_uses_the_room_scoped_booth_id(event):
+    """Verify stop_transcription derives the room-scoped booth id correctly."""
     stop = AsyncMock()
     with patch.object(api_v1, "stop_transcription_worker", stop):
         response = await api_v1.stop_transcription(
@@ -82,6 +84,7 @@ async def test_stop_uses_the_room_scoped_booth_id(event):
 
 @pytest.mark.anyio
 async def test_stop_for_an_unknown_event_is_a_404():
+    """Verify stop_transcription raises 404 when the event is not found."""
     with pytest.raises(api_v1.HTTPException) as exc_info:
         await api_v1.stop_transcription(EVENT_SLUG, ROOM_ID, "en", db=_db(_result(first=None)), token=object())
 
@@ -93,6 +96,7 @@ async def test_stop_for_an_unknown_event_is_a_404():
 
 @pytest.mark.anyio
 async def test_status_reports_every_booth_in_the_room(event):
+    """Verify get_transcription_status reports all booths configured in the room."""
     booths_in_room = [SimpleNamespace(language_code="en"), SimpleNamespace(language_code="fr")]
     db = _db(_result(first=event), _result(all_=booths_in_room))
 
@@ -104,6 +108,7 @@ async def test_status_reports_every_booth_in_the_room(event):
 
 @pytest.mark.anyio
 async def test_status_reports_transcription_running_from_the_worker_registry(event, running_worker):
+    """Verify running status is sourced directly from active_workers registry."""
     running_worker("pycon2026-3-en")
     booths_in_room = [SimpleNamespace(language_code="en"), SimpleNamespace(language_code="fr")]
     db = _db(_result(first=event), _result(all_=booths_in_room))
@@ -117,6 +122,7 @@ async def test_status_reports_transcription_running_from_the_worker_registry(eve
 
 @pytest.mark.anyio
 async def test_status_does_not_count_a_worker_in_another_room(event, running_worker):
+    """Verify worker status is scoped strictly to the requested room."""
     running_worker("pycon2026-4-en")
     db = _db(_result(first=event), _result(all_=[SimpleNamespace(language_code="en")]))
 
@@ -127,6 +133,7 @@ async def test_status_does_not_count_a_worker_in_another_room(event, running_wor
 
 @pytest.mark.anyio
 async def test_status_reports_whether_the_booth_is_live_in_memory(event):
+    """Verify is_active indicates whether the booth is live in memory."""
     db = _db(_result(first=event), _result(all_=[SimpleNamespace(language_code="en")]))
     live = SimpleNamespace(booth_id="pycon2026-3-en")
 
@@ -140,6 +147,7 @@ async def test_status_reports_whether_the_booth_is_live_in_memory(event):
 
 @pytest.mark.anyio
 async def test_status_for_a_room_with_no_booths_is_empty(event):
+    """Verify get_transcription_status returns empty status map when no booths exist."""
     db = _db(_result(first=event), _result(all_=[]))
 
     response = await api_v1.get_transcription_status(EVENT_SLUG, ROOM_ID, db=db, token=object())
@@ -646,3 +654,124 @@ async def test_export_accept_header_case_insensitive(event):
         EVENT_SLUG, ROOM_ID, "en", accept="APPLICATION/X-SUBRIP", db=db_srt, token=object()
     )
     assert res_srt.media_type == "application/x-subrip"
+
+
+def test_parse_accept_header_helper():
+    """Verify _parse_accept_header orders by q-factor, discards q=0, and strips parameters."""
+    assert api_v1._parse_accept_header(None) == []
+    assert api_v1._parse_accept_header("") == []
+    assert api_v1._parse_accept_header("   ") == []
+
+    parsed = api_v1._parse_accept_header("text/vtt;q=0.5, text/srt;q=0.9")
+    assert parsed == ["text/srt", "text/vtt"]
+
+    parsed_q0 = api_v1._parse_accept_header("text/vtt;q=0, text/srt;q=0.8, application/json;q=0.0")
+    assert parsed_q0 == ["text/srt"]
+
+    parsed_params = api_v1._parse_accept_header("text/vtt; charset=utf-8; q=0.7, application/x-subrip; q=0.8")
+    assert parsed_params == ["application/x-subrip", "text/vtt"]
+
+    parsed_ties = api_v1._parse_accept_header("text/srt;q=0.8, application/x-subrip;q=0.8")
+    assert parsed_ties == ["text/srt", "application/x-subrip"]
+
+
+@pytest.mark.anyio
+async def test_export_accept_header_qvalue_priority(event):
+    """Test Accept header negotiation selects format with highest quality value."""
+    booth = SimpleNamespace(id=10, room_id=ROOM_ID, language_code="en")
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
+    segments = [SimpleNamespace(id=1, text="Q test", language_code="en", created_at=now)]
+
+    # SRT has higher q than VTT
+    db1 = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res1 = await api_v1.export_transcript(
+        EVENT_SLUG, ROOM_ID, "en", accept="text/vtt;q=0.5, text/srt;q=0.9", db=db1, token=object()
+    )
+    assert res1.media_type == "text/srt"
+    assert "00:00:00,000" in res1.body.decode("utf-8")
+
+    # VTT has higher q than SRT
+    db2 = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res2 = await api_v1.export_transcript(
+        EVENT_SLUG, ROOM_ID, "en", accept="text/srt;q=0.5, text/vtt;q=0.9", db=db2, token=object()
+    )
+    assert res2.media_type == "text/vtt"
+    assert "WEBVTT" in res2.body.decode("utf-8")
+
+    # application/json has higher q than text/vtt
+    db3 = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res3 = await api_v1.export_transcript(
+        EVENT_SLUG, ROOM_ID, "en", accept="application/json;q=0.9, text/vtt;q=0.5", db=db3, token=object()
+    )
+    assert isinstance(res3, dict)
+    assert "segments" in res3
+
+
+@pytest.mark.anyio
+async def test_export_accept_header_qzero_unacceptable(event):
+    """Test Accept header treats q=0 as unacceptable for format and SRT media type."""
+    booth = SimpleNamespace(id=10, room_id=ROOM_ID, language_code="en")
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
+    segments = [SimpleNamespace(id=1, text="Q0 test", language_code="en", created_at=now)]
+
+    # text/vtt has q=0, falls back to text/srt
+    db1 = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res1 = await api_v1.export_transcript(
+        EVENT_SLUG, ROOM_ID, "en", accept="text/vtt;q=0, text/srt;q=0.8", db=db1, token=object()
+    )
+    assert res1.media_type == "text/srt"
+
+    # text/vtt has q=0, no other format offered, falls back to JSON
+    db2 = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res2 = await api_v1.export_transcript(EVENT_SLUG, ROOM_ID, "en", accept="text/vtt;q=0", db=db2, token=object())
+    assert isinstance(res2, dict)
+    assert "segments" in res2
+
+    # application/x-subrip has q=0, picks text/srt for SRT Content-Type
+    db3 = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res3 = await api_v1.export_transcript(
+        EVENT_SLUG,
+        ROOM_ID,
+        "en",
+        format="srt",
+        accept="application/x-subrip;q=0, text/srt;q=0.7",
+        db=db3,
+        token=object(),
+    )
+    assert res3.media_type == "text/srt"
+
+
+@pytest.mark.anyio
+async def test_export_explicit_format_preserves_behavior_with_accept(event):
+    """Test explicit format query parameter preserves format behavior regardless of Accept."""
+    booth = SimpleNamespace(id=10, room_id=ROOM_ID, language_code="en")
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
+    segments = [SimpleNamespace(id=1, text="Format param test", language_code="en", created_at=now)]
+
+    # Explicit format=srt preserves SRT format even when Accept prefers text/vtt
+    db1 = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res1 = await api_v1.export_transcript(
+        EVENT_SLUG,
+        ROOM_ID,
+        "en",
+        format="srt",
+        accept="text/vtt;q=1.0, application/x-subrip;q=0.8",
+        db=db1,
+        token=object(),
+    )
+    assert res1.media_type == "application/x-subrip"
+    assert "00:00:00,000" in res1.body.decode("utf-8")
+
+    # Explicit format=vtt preserves VTT format even when Accept prefers text/srt
+    db2 = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res2 = await api_v1.export_transcript(
+        EVENT_SLUG,
+        ROOM_ID,
+        "en",
+        format="vtt",
+        accept="text/srt;q=1.0",
+        db=db2,
+        token=object(),
+    )
+    assert res2.media_type == "text/vtt"
+    assert "WEBVTT" in res2.body.decode("utf-8")

@@ -769,6 +769,7 @@ async def patch_room_settings(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("rooms:write")),
 ):
+    """Update room settings for an event."""
     event = await _get_event_for_request(db, event_slug, write_lock=True)
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -784,6 +785,7 @@ async def list_booths(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("booths:read")),
 ):
+    """List all booths associated with a room in an event."""
     result = await db.execute(select(Event).where(Event.slug == event_slug, Event.deleted_at.is_(None)))
     event = result.scalars().first()
     if not event:
@@ -814,6 +816,7 @@ async def get_booth(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("booths:read")),
 ):
+    """Retrieve details and WHIP endpoint for a specific booth in a room."""
     result = await db.execute(select(Event).where(Event.slug == event_slug))
     event = result.scalars().first()
     if not event:
@@ -847,6 +850,7 @@ async def create_booth(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("booths:write")),
 ):
+    """Create a new language booth for a room within an event."""
     event = await _get_event_for_request(db, event_slug, write_lock=True)
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -878,6 +882,7 @@ async def delete_booth_endpoint(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("booths:write")),
 ):
+    """Delete a language booth from a room and revoke active connections."""
     event = await _get_event_for_request(db, event_slug, write_lock=True)
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -909,6 +914,7 @@ async def start_transcription(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:manage")),
 ):
+    """Start transcription worker for a specific booth in a room."""
     event = await _get_event_for_request(db, event_slug, write_lock=True)
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -936,6 +942,7 @@ async def stop_transcription(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:manage")),
 ):
+    """Stop active transcription worker for a specific booth in a room."""
     event = await _get_event_for_request(db, event_slug, write_lock=True)
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -955,6 +962,7 @@ async def get_transcription_status(
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("sessions:read")),
 ):
+    """Retrieve current transcription and activity status for all booths in a room."""
     result = await db.execute(select(Event).where(Event.slug == event_slug))
     event = result.scalars().first()
     if not event:
@@ -1094,6 +1102,39 @@ def _to_srt(items: list[Any], origin: datetime | None = None) -> str:
     return "\n".join(lines)
 
 
+def _parse_accept_header(accept: str | None) -> list[str]:
+    """Parse media ranges from an Accept header ordered by descending quality value (q).
+
+    Media ranges with q=0 (or invalid non-positive quality values) are treated
+    as unacceptable and excluded.
+    """
+    if not accept or not isinstance(accept, str):
+        return []
+
+    parsed: list[tuple[float, int, str]] = []
+    for idx, part in enumerate(accept.split(",")):
+        part = part.strip()
+        if not part:
+            continue
+        segments = [s.strip() for s in part.split(";")]
+        media_type = segments[0].lower()
+        if not media_type:
+            continue
+        q_val = 1.0
+        for param in segments[1:]:
+            param_key, sep, param_val = param.partition("=")
+            if sep and param_key.strip().lower() == "q":
+                try:
+                    q_val = float(param_val.strip())
+                except ValueError:
+                    q_val = 1.0
+        if q_val > 0.0:
+            parsed.append((q_val, -idx, media_type))
+
+    parsed.sort(reverse=True)
+    return [media_type for _, _, media_type in parsed]
+
+
 @router.get(
     "/events/{event_slug}/rooms/{room_id}/booths/{language_code}/transcripts/export",
     response_model=TranscriptExportResponse,
@@ -1210,23 +1251,28 @@ async def export_transcript(
         items = result.scalars().all()
 
     format_str = format if isinstance(format, str) else None
-    accept_str = accept.lower() if isinstance(accept, str) else None
+    accepted_types = _parse_accept_header(accept)
 
     srt_media_type = "text/plain"
-    if accept_str:
-        if "application/x-subrip" in accept_str:
-            srt_media_type = "application/x-subrip"
-        elif "text/srt" in accept_str:
-            srt_media_type = "text/srt"
+    for media_type in accepted_types:
+        if media_type in ("application/x-subrip", "text/srt", "text/plain"):
+            srt_media_type = media_type
+            break
 
     if format_str:
         resolved_format = format_str.lower()
-    elif accept_str and "text/vtt" in accept_str:
-        resolved_format = "vtt"
-    elif accept_str and ("text/srt" in accept_str or "application/x-subrip" in accept_str):
-        resolved_format = "srt"
     else:
         resolved_format = "json"
+        for media_type in accepted_types:
+            if media_type == "text/vtt":
+                resolved_format = "vtt"
+                break
+            if media_type in ("application/x-subrip", "text/srt"):
+                resolved_format = "srt"
+                break
+            if media_type == "application/json":
+                resolved_format = "json"
+                break
 
     if resolved_format == "vtt":
         return PlainTextResponse(_to_vtt(items), media_type="text/vtt")
