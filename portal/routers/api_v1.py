@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from types import SimpleNamespace
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
@@ -30,6 +31,7 @@ from portal.rate_limit import auth_rate_limiter
 from portal.roles import EVENT_OWNER
 from portal.transcription.constants import ProviderEnum
 from portal.transcription.worker import active_workers, start_transcription_worker, stop_transcription_worker
+from portal.websockets.revocation import revoke_booths_for_deleted_entity
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +41,15 @@ router = APIRouter(prefix="/api/v1")
 # attribute on the Event model.  Adding a new provider only requires one
 # new entry here.
 _API_KEY_FIELDS: list[tuple[str, str]] = [
-    ("openai_api_key",             "encrypted_openai_api_key"),
-    ("deepgram_api_key",           "encrypted_deepgram_api_key"),
-    ("nvidia_api_key",             "encrypted_nvidia_api_key"),
-    ("elevenlabs_api_key",         "encrypted_elevenlabs_api_key"),
+    ("openai_api_key", "encrypted_openai_api_key"),
+    ("deepgram_api_key", "encrypted_deepgram_api_key"),
+    ("nvidia_api_key", "encrypted_nvidia_api_key"),
+    ("elevenlabs_api_key", "encrypted_elevenlabs_api_key"),
     ("translation_openai_api_key", "encrypted_translation_openai_api_key"),
-    ("openrouter_api_key",         "encrypted_openrouter_api_key"),
-    ("gemini_api_key",             "encrypted_gemini_api_key"),
-    ("anthropic_api_key",          "encrypted_anthropic_api_key"),
-    ("groq_api_key",               "encrypted_groq_api_key"),
+    ("openrouter_api_key", "encrypted_openrouter_api_key"),
+    ("gemini_api_key", "encrypted_gemini_api_key"),
+    ("anthropic_api_key", "encrypted_anthropic_api_key"),
+    ("groq_api_key", "encrypted_groq_api_key"),
 ]
 
 
@@ -111,6 +113,11 @@ async def _verify_token_rbac(
 ) -> Room | None:
     """Validate OAuth RBAC and optionally lock the event for a mutating request.
 
+    A token whose ``event_id`` does not match ``event`` is answered with the
+    same ``404 Event not found`` an unknown slug gets, for every client type,
+    so that a token scoped to one event cannot be used to probe which other
+    events exist (``docs/threat_model.md`` §3).
+
     manage=True is for creating, changing or deleting rooms and booths, which only Admins and
     Event owners may do (#757); Room coordinators pass only for live-session and read actions.
     write_lock=True serializes the request against concurrent event deletion.
@@ -148,16 +155,24 @@ async def _verify_token_rbac(
         if not resolved_room:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Room not found")
 
+    from portal.models import User
+
+    user = await db.get(User, token.user_id)
+
+    # Account state is security-critical, so read it from the User row rather
+    # than trusting the token: admin_toggle_user_active deactivates a user
+    # without revoking their OAuth tokens, so an unexpired token outlives the
+    # account unless we re-check here, ahead of every bypass below.
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive")
+
     # Confidential clients manage their own RBAC
     client = await db.get(OAuthClient, token.client_id)
     if client and client.is_confidential and client.status == "active":
         return resolved_room
 
-    # Check if user is Admin or event owner
-    from portal.models import User
-
-    user = await db.get(User, token.user_id)
-    if user and getattr(user, "is_admin", False):
+    # Check if user is Admin
+    if getattr(user, "is_admin", False):
         return resolved_room
 
     scope = await load_membership_scope(db, token.user_id)
@@ -169,6 +184,21 @@ async def _verify_token_rbac(
         return resolved_room
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User lost RBAC access to this resource")
+
+
+class EventResponse(BaseModel):
+    id: int = Field(description="Internal database ID.")
+    slug: str = Field(description="URL-safe unique event identifier.")
+    display_name: str = Field(description="Human-readable event name.")
+    owner_id: int | None = Field(
+        default=None,
+        description=(
+            "User ID of the event owner resolved from EventMembership. "
+            "None if no owner membership exists. "
+            "If multiple owner rows exist, the lowest user_id is returned."
+        ),
+    )
+    created_at: str = Field(description="ISO-8601 UTC creation timestamp.")
 
 
 def _extract_room_id(room: Room | Any, room_id: int | str) -> int:
@@ -184,12 +214,31 @@ def _extract_room_id(room: Room | Any, room_id: int | str) -> int:
     return getattr(room, "id", room_id)
 
 
-@router.get("/events/{event_slug}")
+@router.get("/events/{event_slug}", response_model=EventResponse)
 async def get_event(
     event_slug: str,
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("events:read")),
 ):
+    """Retrieve event details by slug.
+
+    Resource-visibility policy (``docs/threat_model.md`` §3) — every case where
+    the caller may not see the event returns an identical
+    ``404 {"detail": "Event not found"}``:
+
+    * the slug does not exist,
+    * the event is soft-deleted (``deleted_at`` set),
+    * the event exists but the token is scoped to a different event.
+
+    A caller therefore cannot tell "no such event" from "not yours", so a token
+    for one event cannot enumerate other events. 403 is reserved for callers
+    whose token *is* scoped to this event but whose user has since lost access
+    (deactivated account, or no owner/coordinator membership) — they already
+    know the event exists, so there is nothing left to leak.
+
+    ``owner_id`` is resolved from ``EventMembership`` (role ``event_owner``);
+    ``Event`` itself has no ``owner_id`` column.
+    """
     result = await db.execute(select(Event).where(Event.slug == event_slug, Event.deleted_at.is_(None)))
     event = result.scalars().first()
     if not event:
@@ -197,11 +246,24 @@ async def get_event(
 
     await _verify_token_rbac(db, token, event, lock_event=True)
 
+    # Lowest user_id wins so the response is stable when an event has several
+    # event_owner rows. One query — do not loop over memberships here.
+    owner_result = await db.execute(
+        select(EventMembership.user_id)
+        .where(
+            EventMembership.event_id == event.id,
+            EventMembership.role == EVENT_OWNER,
+        )
+        .order_by(EventMembership.user_id)
+        .limit(1)
+    )
+    owner_id = owner_result.scalar_one_or_none()
+
     return {
         "id": event.id,
         "slug": event.slug,
         "display_name": event.display_name,
-        "owner_id": event.owner_id,
+        "owner_id": owner_id,
         "created_at": event.created_at.isoformat(),
     }
 
@@ -421,6 +483,7 @@ async def delete_event(
     for b in active_booths:
         await booths.remove_booth(event_slug, b["room_id"], b["language_code"])
 
+    await revoke_booths_for_deleted_entity(db, level="event", target_id=event.id)
     event.deleted_at = datetime.now(timezone.utc)
 
     audit = OAuthAuditLog(
@@ -683,6 +746,7 @@ async def delete_room(
     for b in room_booths:
         await booths.remove_booth(event_slug, b["room_id"], b["language_code"])
 
+    await revoke_booths_for_deleted_entity(db, level="room", target_id=room.id)
     await db.delete(room)
 
     audit = OAuthAuditLog(
@@ -708,9 +772,7 @@ async def patch_room_settings(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    await _verify_token_rbac(
-        db, token, event, room_id, manage=True, lock_event=True, write_lock=True
-    )
+    await _verify_token_rbac(db, token, event, room_id, manage=True, lock_event=True, write_lock=True)
     return {"status": "success"}
 
 
@@ -759,7 +821,11 @@ async def get_booth(
     room = await _verify_token_rbac(db, token, event, room_id, lock_event=True)
     target_room_id = _extract_room_id(room, room_id)
 
-    result = await db.execute(select(DBBooth).where(DBBooth.room_id == target_room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id))
+    result = await db.execute(
+        select(DBBooth).where(
+            DBBooth.room_id == target_room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id
+        )
+    )
     booth = result.scalars().first()
     if not booth:
         raise HTTPException(status_code=404, detail="Booth not found")
@@ -784,12 +850,12 @@ async def create_booth(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    room = await _verify_token_rbac(
-        db, token, event, room_id, manage=True, lock_event=True, write_lock=True
-    )
+    room = await _verify_token_rbac(db, token, event, room_id, manage=True, lock_event=True, write_lock=True)
     target_room_id = _extract_room_id(room, room_id)
 
-    result = await db.execute(select(DBBooth).where(DBBooth.room_id == target_room_id, DBBooth.language_code == language_code))
+    result = await db.execute(
+        select(DBBooth).where(DBBooth.room_id == target_room_id, DBBooth.language_code == language_code)
+    )
     if result.scalars().first():
         raise HTTPException(status_code=409, detail="Booth already exists")
 
@@ -815,18 +881,21 @@ async def delete_booth_endpoint(
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
 
-    room = await _verify_token_rbac(
-        db, token, event, room_id, manage=True, lock_event=True, write_lock=True
-    )
+    room = await _verify_token_rbac(db, token, event, room_id, manage=True, lock_event=True, write_lock=True)
     target_room_id = _extract_room_id(room, room_id)
 
-    result = await db.execute(select(DBBooth).where(DBBooth.room_id == target_room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id))
+    result = await db.execute(
+        select(DBBooth).where(
+            DBBooth.room_id == target_room_id, DBBooth.language_code == language_code, DBBooth.event_id == event.id
+        )
+    )
     booth = result.scalars().first()
     if not booth:
         raise HTTPException(status_code=404, detail="Booth not found")
 
     from portal.database import delete_booth
 
+    await revoke_booths_for_deleted_entity(db, level="booth", target_id=booth.id)
     await delete_booth(db, booth.id)
     return {"status": "deleted"}
 
@@ -910,14 +979,29 @@ async def get_transcription_status(
     return {"room_id": target_room_id, "statuses": statuses}
 
 
+def _format_timestamp(dt: datetime) -> str:
+    """Normalize naive datetimes to UTC before formatting as ISO 8601 string."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
 
 class TranscriptExportItem(BaseModel):
-    """Schema for an exported transcript segment or translation."""
+    """Schema for an individual transcript segment or translation item."""
 
     id: int = Field(description="Segment or translation unique identifier")
     text: str = Field(description="Transcribed or translated text content")
-    language_code: str = Field(description="Language code of this text")
-    created_at: str = Field(description="ISO-8601 UTC timestamp when speech occurred")
+    created_at: str = Field(description="ISO-8601 timestamp when speech occurred")
+
+
+class TranscriptExportResponse(BaseModel):
+    """Schema for exported transcript response envelope."""
+
+    event_slug: str = Field(description="Slug of the event")
+    room_id: int | str = Field(description="Room identifier")
+    language_code: str = Field(description="Language code of source transcript")
+    target_lang: str | None = Field(default=None, description="Target translation language code if requested")
+    segments: list[TranscriptExportItem] = Field(description="Chronological transcript segments")
 
 
 def _to_utc(dt: datetime | None) -> datetime | None:
@@ -990,7 +1074,7 @@ def _to_srt(items: list[Any], origin: datetime | None = None) -> str:
 
 @router.get(
     "/events/{event_slug}/rooms/{room_id}/booths/{language_code}/transcripts/export",
-    response_model=list[TranscriptExportItem],
+    response_model=TranscriptExportResponse,
     responses={
         200: {
             "description": "Exported transcript records in JSON, WebVTT, or SubRip format.",
@@ -1009,24 +1093,36 @@ async def export_transcript(
     event_slug: str,
     room_id: int | str,
     language_code: str,
-    target_lang: str | None = Query(None, description="Target language code to export translated transcripts"),
-    format: str | None = Query(None, pattern="^(json|vtt|srt)$", description="Export format: json (default), vtt, or srt"),
+    target_lang: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            description="Return translations in this language instead of source segments",
+        ),
+    ] = None,
+    format: str | None = Query(
+        None, pattern="^(json|vtt|srt)$", description="Export format: json (default), vtt, or srt"
+    ),
     after: datetime | None = Query(None, description="Filter segments created after this UTC datetime"),
     before: datetime | None = Query(None, description="Filter segments created before this UTC datetime"),
     start_time: datetime | None = Query(None, description="Alias for after"),
     end_time: datetime | None = Query(None, description="Alias for before"),
     limit: int = Query(1000, ge=1, le=5000, description="Maximum number of segments to export"),
-    accept: str | None = Header(None, description="Content negotiation header (e.g. text/vtt, text/srt, application/x-subrip)"),
+    accept: str | None = Header(
+        None, description="Content negotiation header (e.g. text/vtt, text/srt, application/x-subrip)"
+    ),
     db: AsyncSession = Depends(get_db_session),
     token: OAuthToken = Depends(require_oauth_scope("transcripts:read")),
 ):
-    """Export transcripts or translations for a room and language booth.
+    """Export source transcript segments or translations for a room booth in chronological order.
 
     Supports JSON (default), WebVTT (text/vtt), and SubRip (text/plain, text/srt, application/x-subrip).
     Results can be filtered by time range (after/start_time, before/end_time)
     and bounded by limit.
     """
-    result = await db.execute(select(Event).where(Event.slug == event_slug))
+    target_lang = target_lang if isinstance(target_lang, str) else None
+
+    result = await db.execute(select(Event).where(Event.slug == event_slug, Event.deleted_at.is_(None)))
     event = result.scalars().first()
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -1034,30 +1130,36 @@ async def export_transcript(
     room = await _verify_token_rbac(db, token, event, room_id, lock_event=True)
     target_room_id = _extract_room_id(room, room_id)
 
+    # Validate that the booth exists within this event/room
+    result = await db.execute(
+        select(DBBooth).where(
+            DBBooth.room_id == target_room_id,
+            DBBooth.language_code == language_code,
+            DBBooth.event_id == event.id,
+        )
+    )
+    booth = result.scalars().first()
+    if not booth:
+        raise HTTPException(status_code=404, detail="Booth not found")
+
     raw_after = after if isinstance(after, datetime) else (start_time if isinstance(start_time, datetime) else None)
     raw_before = before if isinstance(before, datetime) else (end_time if isinstance(end_time, datetime) else None)
     after_dt = _to_utc(raw_after)
     before_dt = _to_utc(raw_before)
 
-    target_lang_str = target_lang if isinstance(target_lang, str) else None
     limit_val = limit if isinstance(limit, int) else 1000
     safe_limit = min(max(1, limit_val), 5000)
 
-    if target_lang_str:
+    if target_lang:
         stmt = (
-            select(
-                TranscriptTranslation.id,
-                TranscriptTranslation.text,
-                TranscriptTranslation.language_code,
-                TranscriptSegment.created_at.label("created_at"),
-            )
+            select(TranscriptSegment, TranscriptTranslation)
             .join(TranscriptSegment, TranscriptTranslation.segment_id == TranscriptSegment.id)
             .where(
                 TranscriptSegment.room_id == target_room_id,
                 TranscriptSegment.language_code == language_code,
-                TranscriptTranslation.language_code == target_lang_str,
+                TranscriptTranslation.language_code == target_lang,
             )
-            .order_by(TranscriptSegment.created_at)
+            .order_by(TranscriptSegment.created_at, TranscriptSegment.id)
             .limit(safe_limit)
         )
         if after_dt:
@@ -1066,7 +1168,7 @@ async def export_transcript(
             stmt = stmt.where(TranscriptSegment.created_at < before_dt)
 
         result = await db.execute(stmt)
-        items = result.all()
+        items = [SimpleNamespace(id=seg.id, text=tr.text, created_at=seg.created_at) for seg, tr in result.all()]
     else:
         stmt = (
             select(TranscriptSegment)
@@ -1074,7 +1176,7 @@ async def export_transcript(
                 TranscriptSegment.room_id == target_room_id,
                 TranscriptSegment.language_code == language_code,
             )
-            .order_by(TranscriptSegment.created_at)
+            .order_by(TranscriptSegment.created_at, TranscriptSegment.id)
             .limit(safe_limit)
         )
         if after_dt:
@@ -1109,15 +1211,20 @@ async def export_transcript(
     if resolved_format == "srt":
         return PlainTextResponse(_to_srt(items), media_type=srt_media_type)
 
-    return [
-        {
-            "id": item.id,
-            "text": item.text,
-            "language_code": item.language_code,
-            "created_at": _to_utc(item.created_at).isoformat(),
-        }
-        for item in items
-    ]
+    return {
+        "event_slug": event_slug,
+        "room_id": target_room_id,
+        "language_code": language_code,
+        "target_lang": target_lang,
+        "segments": [
+            {
+                "id": item.id,
+                "text": item.text,
+                "created_at": _format_timestamp(item.created_at),
+            }
+            for item in items
+        ],
+    }
 
 
 @router.post("/events/{event_slug}/rooms/{room_id}/listener-token")
