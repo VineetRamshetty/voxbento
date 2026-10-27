@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Annotated, Any
@@ -1026,6 +1027,25 @@ def _format_playback_time(seconds: float, sep: str = ".") -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{ms:03d}"
 
 
+def _sanitize_vtt_text(text: str) -> str:
+    """Sanitize cue text for WebVTT format by collapsing blank lines and escaping syntax markers."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"(\r?\n\s*){2,}", "\n", text.strip())
+    # Escape ampersands and angle brackets for WebVTT
+    cleaned = cleaned.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Neutralize any remaining arrow markers
+    cleaned = cleaned.replace("-->", "--&gt;")
+    return cleaned
+
+
+def _sanitize_srt_text(text: str) -> str:
+    """Sanitize cue text for SubRip (SRT) format by collapsing blank lines."""
+    if not text:
+        return ""
+    return re.sub(r"(\r?\n\s*){2,}", "\n", text.strip())
+
+
 def _to_vtt(items: list[Any], origin: datetime | None = None) -> str:
     """Serialize transcript items to WebVTT format using playback elapsed offsets."""
     if not items:
@@ -1045,7 +1065,8 @@ def _to_vtt(items: list[Any], origin: datetime | None = None) -> str:
             end_sec = start_sec + 5.0
         start = _format_playback_time(start_sec, sep=".")
         end = _format_playback_time(end_sec, sep=".")
-        lines.extend([str(i), f"{start} --> {end}", item.text, ""])
+        cue_text = _sanitize_vtt_text(item.text)
+        lines.extend([str(i), f"{start} --> {end}", cue_text, ""])
     return "\n".join(lines)
 
 
@@ -1068,7 +1089,8 @@ def _to_srt(items: list[Any], origin: datetime | None = None) -> str:
             end_sec = start_sec + 5.0
         start = _format_playback_time(start_sec, sep=",")
         end = _format_playback_time(end_sec, sep=",")
-        lines.extend([str(i), f"{start} --> {end}", item.text, ""])
+        cue_text = _sanitize_srt_text(item.text)
+        lines.extend([str(i), f"{start} --> {end}", cue_text, ""])
     return "\n".join(lines)
 
 
@@ -1188,7 +1210,7 @@ async def export_transcript(
         items = result.scalars().all()
 
     format_str = format if isinstance(format, str) else None
-    accept_str = accept if isinstance(accept, str) else None
+    accept_str = accept.lower() if isinstance(accept, str) else None
 
     srt_media_type = "text/plain"
     if accept_str:

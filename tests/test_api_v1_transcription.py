@@ -569,3 +569,80 @@ async def test_export_real_db_queries_and_filters(real_db):
     result_limited = await api_v1.export_transcript(EVENT_SLUG, room_a.id, "en", limit=1, db=real_db, token=object())
     assert len(result_limited["segments"]) == 1
     assert result_limited["segments"][0]["text"] == "Welcome to room A"
+
+
+@pytest.mark.anyio
+async def test_export_vtt_sanitizes_cue_text(event):
+    """WebVTT export collapses blank lines, escapes ampersands/angle brackets, and neutralizes arrows."""
+    booth = SimpleNamespace(id=10, room_id=ROOM_ID, language_code="en")
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
+    segments = [
+        SimpleNamespace(
+            id=1,
+            text="Line 1\n\n\nLine 2 & <tag> --> arrow",
+            language_code="en",
+            created_at=now,
+        ),
+    ]
+    db = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+
+    response = await api_v1.export_transcript(EVENT_SLUG, ROOM_ID, "en", format="vtt", db=db, token=object())
+    body = response.body.decode("utf-8")
+
+    # Blank lines collapsed to single newline
+    assert "Line 1\nLine 2" in body
+    # Ampersand escaped
+    assert "&amp;" in body
+    # Angle brackets escaped
+    assert "&lt;tag&gt;" in body
+    # Arrow marker neutralized
+    assert "--> arrow" not in body
+    assert "--&gt; arrow" in body
+
+
+@pytest.mark.anyio
+async def test_export_srt_sanitizes_blank_lines_without_html_escaping(event):
+    """SRT export collapses blank lines but does not escape ampersands, brackets, or arrows."""
+    booth = SimpleNamespace(id=10, room_id=ROOM_ID, language_code="en")
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
+    segments = [
+        SimpleNamespace(
+            id=1,
+            text="First line\n\nSecond line & <tag> --> test",
+            language_code="en",
+            created_at=now,
+        ),
+    ]
+    db = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+
+    response = await api_v1.export_transcript(EVENT_SLUG, ROOM_ID, "en", format="srt", db=db, token=object())
+    body = response.body.decode("utf-8")
+
+    # Blank lines collapsed to single newline
+    assert "First line\nSecond line & <tag> --> test" in body
+    # No WebVTT escaping in SRT
+    assert "&amp;" not in body
+    assert "&lt;" not in body
+
+
+@pytest.mark.anyio
+async def test_export_accept_header_case_insensitive(event):
+    """Accept header content negotiation matches media-types case-insensitively."""
+    booth = SimpleNamespace(id=10, room_id=ROOM_ID, language_code="en")
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=timezone.utc)
+    segments = [
+        SimpleNamespace(id=1, text="Case test", language_code="en", created_at=now),
+    ]
+
+    db_vtt = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res_vtt = await api_v1.export_transcript(
+        EVENT_SLUG, ROOM_ID, "en", accept="TEXT/VTT; charset=utf-8", db=db_vtt, token=object()
+    )
+    assert res_vtt.media_type == "text/vtt"
+    assert "WEBVTT" in res_vtt.body.decode("utf-8")
+
+    db_srt = _db(_result(first=event), _result(first=booth), _result(all_=segments))
+    res_srt = await api_v1.export_transcript(
+        EVENT_SLUG, ROOM_ID, "en", accept="APPLICATION/X-SUBRIP", db=db_srt, token=object()
+    )
+    assert res_srt.media_type == "application/x-subrip"
